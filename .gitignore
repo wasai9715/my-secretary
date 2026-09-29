@@ -1,0 +1,8 @@
+.build/
+dist/
+.DS_Store
+*.xcuserstate
+.env
+*.sqlite3
+model.json
+settings.json

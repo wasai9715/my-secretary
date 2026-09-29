@@ -1,0 +1,29 @@
+schema: spec-driven
+
+context: |
+  Language: zh-CN
+  All artifacts must be written in zh-CN.
+  Keep OpenSpec structural headings and SHALL/MUST keywords in English.
+  Project: 单用户、本机运行的 macOS 轻量承诺提醒助手。
+  Product baseline: docs/design/personal-reminder-v1.md
+  Domain language: CONTEXT.md
+  Current app code: 尚未实现；本阶段只建立文档与变更规格。
+  AI: 首版以 DeepSeek 接口验收，连接测试成功后才开放录入。
+
+rules:
+  proposal:
+    - 说明本次变更的边界和不做的内容；按可独立验收的外部行为划分 capability。
+  specs:
+    - 时间字段区分原话明确截止和模型建议完成；用户修改优先于异步模型结果。
+    - 录入、AI 失败、通知不可用、应用重开与合并提醒均须有可检验场景。
+  tasks:
+    - 每个任务包含测试、命令或可观察结果作为验证方式。
+    - 不得把本变更的文档准备标记为应用实现完成。
+
+operations:
+  apply:
+    guidance:
+      - 实现前先读取产品基线、领域术语、变更规格和设计；按任务顺序验证。
+  archive:
+    guidance:
+      - 仅在实现且验收通过后归档；归档时同步 capability specs 到主规格。

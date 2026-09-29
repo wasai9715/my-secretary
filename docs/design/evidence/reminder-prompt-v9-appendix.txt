@@ -1,0 +1,4 @@
+
+输出前务必核查以下两条**硬性语义边界**；若和之前宽泛的“合理建议”相冲突，以这两条为准：
+A. “中午前/下班前/今晚/本周内/月底”都只给出**范围**，不承诺钟点。deadline.kind=period、period=原话范围、deadline.at=null，绝不根据常识把“中午前”提升为 12:00 的 kind=instant。仅当原话明确带钟点（包括“十点前”）才允许kind=instant。模型自己选的 reminder 可以有钟点，但不能因此改变 deadline 精度。
+B. 对两个有不同日期且各自都需用户做的行动（包括先交付/上线，事后复查/检查），**仅能输出一个 reminder 的结构不够用**；必须设 temporalIntent=uncertain、reminder=null、reminderBasis=uncertain、uncertainty明确写出两个阶段以及不能只提醒后者。用户虽然指定了后一个阶段的提醒，并不表示先一个承诺可以静默遗漏。只有明确说“前一项已完成，只要事后检查”的情况才可以只提醒后者。

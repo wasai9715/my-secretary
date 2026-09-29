@@ -1,0 +1,1946 @@
+{
+  "timestamp": "2026-09-29T12:40:00+08:00",
+  "timeZone": "Asia/Shanghai",
+  "model": "deepseek-chat",
+  "prompt": "你是个人 Mac 事项助手。用户输入一句简短原话，你的任务是为它安排一次有用的首次提醒，同时忠实区分：用户明确要求的提醒、计划执行、交付或完成期限、背景时间。不要把语义推断冒充用户给出的精确承诺。\n\n当前本地时间：2026-09-29T12:40:00+08:00\n本地时区：Asia/Shanghai\n\n只输出一个 JSON 对象，不附加任何其他文字。必须包含以下全部字段，未知时使用 null；timeEvidence 可为空数组：\n{\n  \"title\": \"简短但忠于原话的事项标题\",\n  \"timeEvidence\": [{\"quote\": \"原话连续片段\", \"meaning\": \"reminder | planned_action | completion_deadline | contextual_time\", \"precision\": \"instant | day | period\"}],\n  \"temporalIntent\": \"none | reminder | planned_action | completion_deadline | mixed | uncertain\",\n  \"reminder\": \"ISO8601 带本地时区偏移量的时刻 | null\",\n  \"reminderBasis\": \"explicit | inferred | no_time_default | uncertain\",\n  \"deadline\": {\"kind\": \"none | day | period | instant\", \"day\": \"YYYY-MM-DD | null\", \"period\": \"原话的时间段 | null\", \"at\": \"ISO8601 带时区偏移量的时刻 | null\", \"basis\": \"explicit | context_inferred | none\", \"evidence\": \"原话连续片段 | null\"},\n  \"suggestedCompletion\": \"ISO8601 带时区偏移量的时刻 | null\",\n  \"uncertainty\": \"无法可靠确定的语义或时间 | null\"\n}\n\n请按以下顺序思考，再一次性输出 JSON：\n\n一、识别“哪件事、何时做、何时提醒、何时必须完成”，优先从句法关系判断，不要仅凭日期词或动作动词推断期限。\n- “提醒我／叫我／通知我”后面的时间属于提醒；“记得做……”只是表达记事，并没有明确提醒时刻。仅有日期、早上、下午等时段而没有钟点，意图可为 reminder，但最终选择的具体钟点属于 inferred，不能标 explicit。\n- “……前／截止／必须在……完成”是明确期限。带日期的交付、提交、发给别人、发布或上线结果可能暗含当日达成目标，可推断仅日期截止，deadline.basis=context_inferred；是否构成期限要结合整个句子。单纯计划做、找时间做、顺路做、买东西、赴约等仅是执行时间，不构成完成截止。“给某人买东西”不等于“必须当日交付”。\n- 工作时段、他人安排、前置条件可能只是背景：“十点下班”不是“十点提醒我”，也不是“买菜十点截止”。依赖他人反馈且未知何时反馈时，不要自称知道触发时刻。\n- 否定、取消和修正优先于被否定的时间；如“不在今天做，明天再做”不能把今天当有效计划。\n- 一句话有多件行动时，首次提醒应照顾最早需要用户做的行动；若用户明确指定针对某行动的提醒，遵守该指令。交付后的复查是后续动作：针对复查的提醒可以晚于交付日期，不能与交付前的提醒混作同一义务。\n\n二、保留期限精度及出处。\n- deadline.kind=instant 仅当原话有具体截止钟点；deadline.at 填真实截止时刻。具体“提醒时刻”、会议开始或下班钟点不能填进 deadline.at。\n- 只明确某天要交付但没有时分：kind=day、day 填日期、at=null。原话明确有“之前/截止”等约束时 basis=explicit；根据交付语义推断义务时 basis=context_inferred。原话明说了日期，不代表完成义务也属于 explicit。\n- “下班前／今晚／本周内／周末之前”等只限定范围时：kind=period，period 保留原词，at=null；能可靠确定当天日期才填 day，不要擅自把“下班前”变成 18:00。计划在某时段做事不自动等于必须在该时段完成。\n- 没有交付约束时 kind=none，其他 deadline 字段均为 null，basis=none。timeEvidence.quote 和 deadline.evidence 必须是输入原话中原样连续出现的片段；不确定时不要编造引用。\n\n三、安排首次提醒（reminder），与完成时间分离。\n- 若用户明确给出提醒钟点或相对分钟数，严格换算成将来时刻；reminderBasis=explicit。用户只给提醒日期或模糊时段、你自己选择了钟点时，reminderBasis=inferred，不要宣称具体时刻由用户说出。\n- 有明确的执行日期而没有要求提前提醒时，优先在执行日期选择合理的提醒时刻；不得悄悄提前至前一日或落回现在加15分钟。执行时段较晚时可在同日更早提醒，使用户有处理时间；若同句明确了先做的准备工作，应在准备日期提醒，不要只提醒最后一件事。\n- 有明确交付期限时，选择当前时刻之后、预计需处理之前的首次提醒；仅日期/时间段期限都不能被你选的提醒钟点升级为精确截止。任务需要准备时可提前于交付日期提醒；若出现“交付后提醒我复查”，以后续复查的明确提醒为准，并在 mixed 中保留交付日期。\n- 完全没有时间线索：reminder=null 且 reminderBasis=no_time_default，由程序在录入后15分钟提醒。出现“稍后”“有空”“等别人反馈”等无法换算的条件：reminder=null 且 reminderBasis=uncertain，在 uncertainty 说明，不私自定任意整点。\n- reminder 不得早于提供的当前本地时间。若原本理想的提前提醒时间已过，选现在之后且仍有用的时刻；若已无法给出有用时间，返回 null/uncertain，不返回过去日期。\n- suggestedCompletion 默认 null；只有原话表达合理完成窗口，且建议有助于用户判断时才填写。它不是原话截止，不得与提醒同刻或早于首次提醒，不要为普通计划凭空推测“下班前完成”。\n\n四、核对输出的一致性：标题不增加事实；如果没有明确截止则不输出截止；提醒的具体时刻与 reminderBasis 相符；期限精度与原话相符；时间证据真实存在；将来计划的提醒没有无故移到前一天；若无法可靠区分计划和期限，标记 temporalIntent=uncertain、reminderBasis=uncertain，使用 null 而非强猜。\n\n\n补充严格自检（优先于笼统的常见时间经验，不得覆盖原话明确要求）：\n- 在输出前把 reminder 转为当前时区并与当前本地时间逐秒比较；若 reminder 早于当前时刻，无论你觉得“提前提醒”多合理，都必须改成未来仍有用的时刻或返回 null/uncertain。月底、本周内等周期时间也必须检查当前日期，不能推荐周期里已经过去的那一天。\n- 有人要在“今天”收到交付物时，优先保证提醒足够早以便同一天仍有时间处理；不应在普通日间事项上无依据推到晚上。相反，用户明确说“今晚”的事项可以晚上提醒。不得假定真实下班钟点。\n- “某天发布/上线/交付/提交”表达该日需要达成的结果时，即使没有“前/截止”，也要同时说明语义推断的 date-only 完成约束；与只有“某天看看/处理/聊聊”的计划区分。发给别人或发布属于交付动作；“给别人买东西”只是购买安排，未要求同日交付时不是截止。\n- 用于行动的时间若只是别人的会议/下班/反馈的开始时刻，不能把它原封不动当“询问结果”的提醒时刻；未知结束或反馈时刻时标 uncertain 并返回 null，或在有依据的稍后时刻提醒，不能提前到结果根本不存在时。\n- 如果原话含两个独立日期的动作，且一个 reminder 字段无法同时保证较早动作不被忘掉又遵守明确要求的较晚提醒：不要暗中只安排较晚动作并声称整条安排成功。将 temporalIntent 置为 uncertain、reminderBasis=uncertain、reminder=null，uncertainty 说明两个动作及单一提醒不足；deadline 只陈述原话明确或合理推断的最早交付约束。\n- JSON 的 uncertainty 只写真正影响提醒可靠性的未知项；如果 no_time_default 已成立，无须在 uncertainty 重述“没有时间线索”。\n\n\n最后仅检查三个不能被模型“解释过去”的错误，不改变前面的默认规则：\n1. 若有明确精确截止时刻且仍在将来，reminder 必须严格早于截止且晚于现在；即使只剩20分钟，也可以安排几分钟内提醒，不能等到截止同刻或放弃提醒。检查 ISO8601 时区换算后再输出。\n2. 原话有两个不同日期、都由用户负责的独立行动，而一个 reminder 不能同时覆盖（例如先完成交付、后来复查），返回 temporalIntent=uncertain、reminder=null、reminderBasis=uncertain，uncertainty 说明两个阶段和为何不能静默只安排后者；deadline 保留可以确认的交付日期。只有一项行动、另一个时间是背景则照常安排，不要滥用 uncertain。\n3. 否定的旧日期不再生效，但之后修正出的“某天把东西发/交/提交给别人”仍是语义推断的那一天的交付期限，不能仅因为出现否定句就丢失交付；普通计划、买东西不凭空产生截止。\n\n\n输出前务必核查以下两条**硬性语义边界**；若和之前宽泛的“合理建议”相冲突，以这两条为准：\nA. “中午前/下班前/今晚/本周内/月底”都只给出**范围**，不承诺钟点。deadline.kind=period、period=原话范围、deadline.at=null，绝不根据常识把“中午前”提升为 12:00 的 kind=instant。仅当原话明确带钟点（包括“十点前”）才允许kind=instant。模型自己选的 reminder 可以有钟点，但不能因此改变 deadline 精度。\nB. 对两个有不同日期且各自都需用户做的行动（包括先交付/上线，事后复查/检查），**仅能输出一个 reminder 的结构不够用**；必须设 temporalIntent=uncertain、reminder=null、reminderBasis=uncertain、uncertainty明确写出两个阶段以及不能只提醒后者。用户虽然指定了后一个阶段的提醒，并不表示先一个承诺可以静默遗漏。只有明确说“前一项已完成，只要事后检查”的情况才可以只提醒后者。\n",
+  "cases": [
+    {
+      "id": 1,
+      "category": "无时间",
+      "input": "帮我查一下订单为什么没支付",
+      "result": {
+        "title": "查一下订单为什么没支付",
+        "timeEvidence": [],
+        "temporalIntent": "none",
+        "reminder": null,
+        "reminderBasis": "no_time_default",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 0.93
+    },
+    {
+      "id": 2,
+      "category": "无时间",
+      "input": "领导让导一份销售数据，稍后处理",
+      "result": {
+        "title": "给领导导一份销售数据",
+        "timeEvidence": [
+          {
+            "quote": "稍后处理",
+            "meaning": "planned_action",
+            "precision": "period"
+          }
+        ],
+        "temporalIntent": "uncertain",
+        "reminder": null,
+        "reminderBasis": "uncertain",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": "“稍后”无法换算为具体提醒时刻，且未说明领导何时需要这份数据，因此不能确定首次提醒时间。"
+      },
+      "seconds": 1.25
+    },
+    {
+      "id": 3,
+      "category": "无时间",
+      "input": "记得回运营的问题",
+      "result": {
+        "title": "回运营的问题",
+        "timeEvidence": [],
+        "temporalIntent": "none",
+        "reminder": null,
+        "reminderBasis": "no_time_default",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 0.93
+    },
+    {
+      "id": 4,
+      "category": "无时间",
+      "input": "把这个接口错误看一下",
+      "result": {
+        "title": "把这个接口错误看一下",
+        "timeEvidence": [],
+        "temporalIntent": "none",
+        "reminder": null,
+        "reminderBasis": "no_time_default",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.29
+    },
+    {
+      "id": 5,
+      "category": "无时间",
+      "input": "帮同事把测试账号开一下",
+      "result": {
+        "type": "json_object",
+        "title": "帮同事开测试账号",
+        "timeEvidence": [],
+        "temporalIntent": "none",
+        "reminder": null,
+        "reminderBasis": "no_time_default",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 0.59
+    },
+    {
+      "id": 6,
+      "category": "无时间",
+      "input": "收到需求后记得找产品确认",
+      "result": {
+        "title": "收到需求后找产品确认",
+        "timeEvidence": [
+          {
+            "quote": "收到需求后",
+            "meaning": "contextual_time",
+            "precision": "instant"
+          }
+        ],
+        "temporalIntent": "uncertain",
+        "reminder": null,
+        "reminderBasis": "uncertain",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": "“收到需求后”依赖他人发来需求，未知何时触发，无法换算成具体提醒时刻；且“记得做”只表达记事，未指定提醒时刻。"
+      },
+      "seconds": 1.26
+    },
+    {
+      "id": 7,
+      "category": "计划日期",
+      "input": "明天帮妈妈买水果",
+      "result": {
+        "title": "帮妈妈买水果",
+        "timeEvidence": [
+          {
+            "quote": "明天",
+            "meaning": "planned_action",
+            "precision": "day"
+          }
+        ],
+        "temporalIntent": "planned_action",
+        "reminder": "2026-09-30T10:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.03
+    },
+    {
+      "id": 8,
+      "category": "计划日期",
+      "input": "后天给阿姨买东西",
+      "result": {
+        "title": "给阿姨买东西",
+        "timeEvidence": [
+          {
+            "quote": "后天",
+            "meaning": "planned_action",
+            "precision": "day"
+          }
+        ],
+        "temporalIntent": "planned_action",
+        "reminder": "2026-10-01T10:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.11
+    },
+    {
+      "id": 9,
+      "category": "计划日期",
+      "input": "明天记得写周报",
+      "result": {
+        "title": "写周报",
+        "timeEvidence": [
+          {
+            "quote": "明天",
+            "meaning": "planned_action",
+            "precision": "day"
+          },
+          {
+            "quote": "记得写周报",
+            "meaning": "reminder",
+            "precision": "day"
+          }
+        ],
+        "temporalIntent": "reminder",
+        "reminder": "2026-09-30T09:30:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": "原话只说明天写周报，未给出具体钟点或其他时间偏好，提醒钟点为推断所得。"
+      },
+      "seconds": 1.45
+    },
+    {
+      "id": 10,
+      "category": "计划日期",
+      "input": "周五整理报表",
+      "result": {
+        "title": "整理报表",
+        "timeEvidence": [
+          {
+            "quote": "周五",
+            "meaning": "planned_action",
+            "precision": "day"
+          }
+        ],
+        "temporalIntent": "planned_action",
+        "reminder": "2026-10-02T10:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.24
+    },
+    {
+      "id": 11,
+      "category": "计划日期",
+      "input": "下周二查一下库存差异",
+      "result": {
+        "title": "查一下库存差异",
+        "timeEvidence": [
+          {
+            "quote": "下周二",
+            "meaning": "planned_action",
+            "precision": "day"
+          }
+        ],
+        "temporalIntent": "planned_action",
+        "reminder": "2026-10-06T10:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 0.91
+    },
+    {
+      "id": 12,
+      "category": "计划日期",
+      "input": "10月2号去取快递",
+      "result": {
+        "title": "去取快递",
+        "timeEvidence": [
+          {
+            "quote": "10月2号",
+            "meaning": "planned_action",
+            "precision": "day"
+          }
+        ],
+        "temporalIntent": "planned_action",
+        "reminder": "2026-10-02T09:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 0.88
+    },
+    {
+      "id": 13,
+      "category": "计划日期",
+      "input": "明早去银行办事",
+      "result": {
+        "title": "明早去银行办事",
+        "timeEvidence": [
+          {
+            "quote": "明早",
+            "meaning": "planned_action",
+            "precision": "period"
+          }
+        ],
+        "temporalIntent": "planned_action",
+        "reminder": "2026-09-30T08:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.07
+    },
+    {
+      "id": 14,
+      "category": "计划日期",
+      "input": "后天下午和设计师聊一下",
+      "result": {
+        "title": "和设计师聊一下",
+        "timeEvidence": [
+          {
+            "quote": "后天下午",
+            "meaning": "planned_action",
+            "precision": "period"
+          }
+        ],
+        "temporalIntent": "planned_action",
+        "reminder": "2026-10-01T14:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": "原话只给出“后天下午”这一时段，未指定具体钟点；提醒时刻14:00为推断选择。"
+      },
+      "seconds": 1.24
+    },
+    {
+      "id": 15,
+      "category": "计划日期",
+      "input": "明天下班后顺路买菜",
+      "result": {
+        "title": "明天下班后顺路买菜",
+        "timeEvidence": [
+          {
+            "quote": "明天下班后",
+            "meaning": "planned_action",
+            "precision": "period"
+          }
+        ],
+        "temporalIntent": "planned_action",
+        "reminder": "2026-09-30T12:45:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.13
+    },
+    {
+      "id": 16,
+      "category": "计划日期",
+      "input": "今天晚上调整测试环境配置",
+      "result": {
+        "title": "今天晚上调整测试环境配置",
+        "timeEvidence": [
+          {
+            "quote": "今天晚上",
+            "meaning": "planned_action",
+            "precision": "period"
+          }
+        ],
+        "temporalIntent": "planned_action",
+        "reminder": "2026-09-29T20:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.09
+    },
+    {
+      "id": 17,
+      "category": "明确提醒",
+      "input": "下午三点提醒我回复运营",
+      "result": {
+        "title": "回复运营",
+        "timeEvidence": [
+          {
+            "quote": "下午三点",
+            "meaning": "reminder",
+            "precision": "instant"
+          }
+        ],
+        "temporalIntent": "reminder",
+        "reminder": "2026-09-29T15:00:00+08:00",
+        "reminderBasis": "explicit",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.0
+    },
+    {
+      "id": 18,
+      "category": "明确提醒",
+      "input": "十分钟后叫我发邮件",
+      "result": {
+        "title": "十分钟后叫我发邮件",
+        "timeEvidence": [
+          {
+            "quote": "十分钟后",
+            "meaning": "reminder",
+            "precision": "instant"
+          },
+          {
+            "quote": "叫我发邮件",
+            "meaning": "planned_action",
+            "precision": "day"
+          }
+        ],
+        "temporalIntent": "reminder",
+        "reminder": "2026-09-29T12:50:00+08:00",
+        "reminderBasis": "explicit",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 0.97
+    },
+    {
+      "id": 19,
+      "category": "明确提醒",
+      "input": "明天九点提醒我去开会",
+      "result": {
+        "title": "去开会",
+        "timeEvidence": [
+          {
+            "quote": "明天九点提醒我",
+            "meaning": "reminder",
+            "precision": "instant"
+          }
+        ],
+        "temporalIntent": "reminder",
+        "reminder": "2026-09-30T09:00:00+08:00",
+        "reminderBasis": "explicit",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 0.96
+    },
+    {
+      "id": 20,
+      "category": "明确提醒",
+      "input": "10月2号提醒我买票",
+      "result": {
+        "title": "买票",
+        "timeEvidence": [
+          {
+            "quote": "10月2号提醒我买票",
+            "meaning": "reminder",
+            "precision": "day"
+          }
+        ],
+        "temporalIntent": "none",
+        "reminder": "2026-10-02T09:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.09
+    },
+    {
+      "id": 21,
+      "category": "明确提醒",
+      "input": "后天买东西，今天下午四点提醒我列清单",
+      "result": {
+        "title": "后天买东西，今天下午四点提醒我列清单",
+        "timeEvidence": [
+          {
+            "quote": "后天",
+            "meaning": "planned_action",
+            "precision": "day"
+          },
+          {
+            "quote": "今天下午四点提醒我列清单",
+            "meaning": "reminder",
+            "precision": "instant"
+          }
+        ],
+        "temporalIntent": "reminder",
+        "reminder": "2026-09-29T16:00:00+08:00",
+        "reminderBasis": "explicit",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 0.84
+    },
+    {
+      "id": 22,
+      "category": "明确提醒",
+      "input": "周五早上提醒我整理数据",
+      "result": {
+        "title": "周五早上提醒整理数据",
+        "timeEvidence": [
+          {
+            "quote": "周五早上",
+            "meaning": "reminder",
+            "precision": "period"
+          },
+          {
+            "quote": "提醒我整理数据",
+            "meaning": "reminder",
+            "precision": "period"
+          }
+        ],
+        "temporalIntent": "reminder",
+        "reminder": "2026-10-02T09:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.25
+    },
+    {
+      "id": 23,
+      "category": "仅日期交付",
+      "input": "今天给领导一份报表",
+      "result": {
+        "title": "今天给领导一份报表",
+        "timeEvidence": [
+          {
+            "quote": "今天",
+            "meaning": "completion_deadline",
+            "precision": "day"
+          }
+        ],
+        "temporalIntent": "completion_deadline",
+        "reminder": "2026-09-29T12:55:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "day",
+          "day": "2026-09-29",
+          "period": null,
+          "at": null,
+          "basis": "context_inferred",
+          "evidence": "今天"
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.19
+    },
+    {
+      "id": 24,
+      "category": "仅日期交付",
+      "input": "明天把方案交给客户",
+      "result": {
+        "title": "把方案交给客户",
+        "timeEvidence": [
+          {
+            "quote": "明天",
+            "meaning": "completion_deadline",
+            "precision": "day"
+          }
+        ],
+        "temporalIntent": "completion_deadline",
+        "reminder": "2026-09-30T09:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "day",
+          "day": "2026-09-30",
+          "period": null,
+          "at": null,
+          "basis": "context_inferred",
+          "evidence": "明天"
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.16
+    },
+    {
+      "id": 25,
+      "category": "仅日期交付",
+      "input": "后天发布新版本",
+      "result": {
+        "title": "后天发布新版本",
+        "timeEvidence": [
+          {
+            "quote": "后天",
+            "meaning": "planned_action",
+            "precision": "day"
+          },
+          {
+            "quote": "后天发布新版本",
+            "meaning": "completion_deadline",
+            "precision": "day"
+          }
+        ],
+        "temporalIntent": "completion_deadline",
+        "reminder": "2026-10-01T09:30:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "day",
+          "day": "2026-10-01",
+          "period": null,
+          "at": null,
+          "basis": "context_inferred",
+          "evidence": "后天发布新版本"
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.22
+    },
+    {
+      "id": 26,
+      "category": "仅日期交付",
+      "input": "今天上线策略系统",
+      "result": {
+        "title": "今天上线策略系统",
+        "timeEvidence": [
+          {
+            "quote": "今天上线",
+            "meaning": "planned_action",
+            "precision": "day"
+          }
+        ],
+        "temporalIntent": "planned_action",
+        "reminder": "2026-09-29T13:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "day",
+          "day": "2026-09-29",
+          "period": null,
+          "at": null,
+          "basis": "context_inferred",
+          "evidence": "今天上线"
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 0.94
+    },
+    {
+      "id": 27,
+      "category": "仅日期交付",
+      "input": "周五发给运营最终名单",
+      "result": {
+        "title": "周五发给运营最终名单",
+        "timeEvidence": [
+          {
+            "quote": "周五",
+            "meaning": "completion_deadline",
+            "precision": "day"
+          }
+        ],
+        "temporalIntent": "completion_deadline",
+        "reminder": "2026-10-02T10:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "day",
+          "day": "2026-10-02",
+          "period": null,
+          "at": null,
+          "basis": "context_inferred",
+          "evidence": "周五"
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.27
+    },
+    {
+      "id": 28,
+      "category": "仅日期交付",
+      "input": "10月3日提交申请",
+      "result": {
+        "title": "提交申请",
+        "timeEvidence": [
+          {
+            "quote": "10月3日提交申请",
+            "meaning": "completion_deadline",
+            "precision": "day"
+          }
+        ],
+        "temporalIntent": "completion_deadline",
+        "reminder": "2026-10-02T18:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "day",
+          "day": "2026-10-03",
+          "period": null,
+          "at": null,
+          "basis": "context_inferred",
+          "evidence": "10月3日提交申请"
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.11
+    },
+    {
+      "id": 29,
+      "category": "仅日期交付",
+      "input": "月底要把需求文档交付给产品",
+      "result": {
+        "title": "月底把需求文档交付给产品",
+        "timeEvidence": [
+          {
+            "quote": "月底",
+            "meaning": "completion_deadline",
+            "precision": "period"
+          }
+        ],
+        "temporalIntent": "completion_deadline",
+        "reminder": "2026-09-30T09:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "period",
+          "day": null,
+          "period": "月底",
+          "at": null,
+          "basis": "explicit",
+          "evidence": "月底"
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.08
+    },
+    {
+      "id": 30,
+      "category": "精确截止",
+      "input": "明天10点前给运营数据",
+      "result": {
+        "title": "给运营数据",
+        "timeEvidence": [
+          {
+            "quote": "明天10点前",
+            "meaning": "completion_deadline",
+            "precision": "instant"
+          }
+        ],
+        "temporalIntent": "completion_deadline",
+        "reminder": "2026-09-30T08:30:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "instant",
+          "day": null,
+          "period": null,
+          "at": "2026-09-30T10:00:00+08:00",
+          "basis": "explicit",
+          "evidence": "明天10点前"
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 0.99
+    },
+    {
+      "id": 31,
+      "category": "精确截止",
+      "input": "今晚八点之前把报表发给领导",
+      "result": {
+        "title": "把报表发给领导",
+        "timeEvidence": [
+          {
+            "quote": "今晚八点之前",
+            "meaning": "completion_deadline",
+            "precision": "instant"
+          }
+        ],
+        "temporalIntent": "completion_deadline",
+        "reminder": "2026-09-29T19:30:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "instant",
+          "day": "2026-09-29",
+          "period": null,
+          "at": "2026-09-29T20:00:00+08:00",
+          "basis": "explicit",
+          "evidence": "今晚八点之前"
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.26
+    },
+    {
+      "id": 32,
+      "category": "精确截止",
+      "input": "周五下午三点截止报名，提醒我提交",
+      "result": {
+        "title": "周五下午三点截止报名，提醒我提交",
+        "timeEvidence": [
+          {
+            "quote": "周五下午三点截止报名",
+            "meaning": "completion_deadline",
+            "precision": "instant"
+          },
+          {
+            "quote": "提醒我提交",
+            "meaning": "reminder",
+            "precision": "instant"
+          }
+        ],
+        "temporalIntent": "reminder",
+        "reminder": "2026-10-02T14:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "instant",
+          "day": "2026-10-02",
+          "period": null,
+          "at": "2026-10-02T15:00:00+08:00",
+          "basis": "explicit",
+          "evidence": "周五下午三点截止报名"
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.17
+    },
+    {
+      "id": 33,
+      "category": "精确截止",
+      "input": "下午一点前把 bug 修完",
+      "result": {
+        "title": "下午一点前把 bug 修完",
+        "timeEvidence": [
+          {
+            "quote": "下午一点前",
+            "meaning": "completion_deadline",
+            "precision": "instant"
+          },
+          {
+            "quote": "把 bug 修完",
+            "meaning": "completion_deadline",
+            "precision": "day"
+          }
+        ],
+        "temporalIntent": "completion_deadline",
+        "reminder": "2026-09-29T12:45:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "instant",
+          "day": "2026-09-29",
+          "period": null,
+          "at": "2026-09-29T13:00:00+08:00",
+          "basis": "explicit",
+          "evidence": "下午一点前"
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.18
+    },
+    {
+      "id": 34,
+      "category": "精确截止",
+      "input": "十分钟内给我发截图",
+      "result": {
+        "title": "十分钟内发截图",
+        "timeEvidence": [
+          {
+            "quote": "十分钟内",
+            "meaning": "completion_deadline",
+            "precision": "instant"
+          }
+        ],
+        "temporalIntent": "completion_deadline",
+        "reminder": "2026-09-29T12:45:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "instant",
+          "day": "2026-09-29",
+          "period": null,
+          "at": "2026-09-29T12:50:00+08:00",
+          "basis": "explicit",
+          "evidence": "十分钟内"
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.13
+    },
+    {
+      "id": 35,
+      "category": "时间段",
+      "input": "明天下班前配置导出任务",
+      "result": {
+        "title": "配置导出任务",
+        "timeEvidence": [
+          {
+            "quote": "明天下午",
+            "meaning": "completion_deadline",
+            "precision": "period"
+          }
+        ],
+        "temporalIntent": "completion_deadline",
+        "reminder": "2026-09-30T14:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.19
+    },
+    {
+      "id": 36,
+      "category": "时间段",
+      "input": "今晚把工作总结发出去",
+      "result": {
+        "title": "今晚把工作总结发出去",
+        "timeEvidence": [
+          {
+            "quote": "今晚",
+            "meaning": "planned_action",
+            "precision": "period"
+          },
+          {
+            "quote": "发出去",
+            "meaning": "completion_deadline",
+            "precision": "day"
+          }
+        ],
+        "temporalIntent": "mixed",
+        "reminder": "2026-09-29T20:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "period",
+          "day": "2026-09-29",
+          "period": "今晚",
+          "at": null,
+          "basis": "context_inferred",
+          "evidence": "今晚"
+        },
+        "suggestedCompletion": null,
+        "uncertainty": "原话只说“今晚”这一时段，未给出具体钟点；提醒钟点为模型推断，无精确截止时刻。"
+      },
+      "seconds": 1.35
+    },
+    {
+      "id": 37,
+      "category": "时间段",
+      "input": "本周内完成财务核对",
+      "result": {
+        "title": "本周内完成财务核对",
+        "timeEvidence": [
+          {
+            "quote": "本周内",
+            "meaning": "completion_deadline",
+            "precision": "period"
+          }
+        ],
+        "temporalIntent": "completion_deadline",
+        "reminder": "2026-09-30T10:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "period",
+          "day": null,
+          "period": "本周内",
+          "at": null,
+          "basis": "explicit",
+          "evidence": "本周内"
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 0.98
+    },
+    {
+      "id": 38,
+      "category": "时间段",
+      "input": "明天中午前整理好会议材料",
+      "result": {
+        "title": "整理好会议材料",
+        "timeEvidence": [
+          {
+            "quote": "明天中午前",
+            "meaning": "completion_deadline",
+            "precision": "period"
+          }
+        ],
+        "temporalIntent": "completion_deadline",
+        "reminder": "2026-09-30T09:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "period",
+          "day": "2026-09-30",
+          "period": "中午前",
+          "at": null,
+          "basis": "explicit",
+          "evidence": "明天中午前"
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 0.91
+    },
+    {
+      "id": 39,
+      "category": "时间段",
+      "input": "周末之前给负责人反馈",
+      "result": {
+        "title": "周末之前给负责人反馈",
+        "timeEvidence": [
+          {
+            "quote": "周末之前",
+            "meaning": "completion_deadline",
+            "precision": "period"
+          }
+        ],
+        "temporalIntent": "completion_deadline",
+        "reminder": "2026-10-01T10:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "period",
+          "day": null,
+          "period": "周末之前",
+          "at": null,
+          "basis": "explicit",
+          "evidence": "周末之前"
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 0.89
+    },
+    {
+      "id": 40,
+      "category": "上下文时间",
+      "input": "晚上十点下班后买菜回家",
+      "result": {
+        "title": "下班后买菜回家",
+        "timeEvidence": [
+          {
+            "quote": "晚上十点下班后",
+            "meaning": "contextual_time",
+            "precision": "instant"
+          },
+          {
+            "quote": "买菜回家",
+            "meaning": "planned_action",
+            "precision": "period"
+          }
+        ],
+        "temporalIntent": "planned_action",
+        "reminder": "2026-09-29T21:55:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.27
+    },
+    {
+      "id": 41,
+      "category": "上下文时间",
+      "input": "等运营明天反馈后再查这个问题",
+      "result": {
+        "title": "等运营明天反馈后再查这个问题",
+        "timeEvidence": [
+          {
+            "quote": "明天",
+            "meaning": "contextual_time",
+            "precision": "day"
+          },
+          {
+            "quote": "等运营明天反馈后再",
+            "meaning": "planned_action",
+            "precision": "period"
+          }
+        ],
+        "temporalIntent": "uncertain",
+        "reminder": null,
+        "reminderBasis": "uncertain",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": "提醒依赖运营反馈，原话未给出反馈时刻或“再查”的具体时间，无法确定可靠的首次提醒时刻。"
+      },
+      "seconds": 1.35
+    },
+    {
+      "id": 42,
+      "category": "上下文时间",
+      "input": "客户三点开会，记得问一下结论",
+      "result": {
+        "title": "客户三点开会，记得问一下结论",
+        "timeEvidence": [
+          {
+            "quote": "客户三点开会",
+            "meaning": "contextual_time",
+            "precision": "instant"
+          },
+          {
+            "quote": "记得问一下结论",
+            "meaning": "reminder",
+            "precision": "instant"
+          }
+        ],
+        "temporalIntent": "uncertain",
+        "reminder": null,
+        "reminderBasis": "uncertain",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": "客户三点开会是背景时间，结论何时产生未知，无法确定询问结论的有效时刻，不擅自安排在15:00整询问"
+      },
+      "seconds": 0.98
+    },
+    {
+      "id": 43,
+      "category": "上下文时间",
+      "input": "明天八点开会，今天先准备材料",
+      "result": {
+        "title": "明天八点开会，今天先准备材料",
+        "timeEvidence": [
+          {
+            "quote": "明天八点开会",
+            "meaning": "planned_action",
+            "precision": "instant"
+          },
+          {
+            "quote": "今天先准备材料",
+            "meaning": "planned_action",
+            "precision": "day"
+          }
+        ],
+        "temporalIntent": "mixed",
+        "reminder": "2026-09-29T14:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.29
+    },
+    {
+      "id": 44,
+      "category": "混合",
+      "input": "明天十点交报告，今天四点提醒我准备",
+      "result": {
+        "title": "明天十点交报告，今天四点提醒准备",
+        "timeEvidence": [
+          {
+            "quote": "明天十点交报告",
+            "meaning": "completion_deadline",
+            "precision": "instant"
+          },
+          {
+            "quote": "今天四点提醒我准备",
+            "meaning": "reminder",
+            "precision": "instant"
+          }
+        ],
+        "temporalIntent": "reminder",
+        "reminder": "2026-09-29T16:00:00+08:00",
+        "reminderBasis": "explicit",
+        "deadline": {
+          "kind": "instant",
+          "day": "2026-09-30",
+          "period": null,
+          "at": "2026-09-30T10:00:00+08:00",
+          "basis": "explicit",
+          "evidence": "明天十点交报告"
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.28
+    },
+    {
+      "id": 45,
+      "category": "混合",
+      "input": "后天交数据，明天早上提醒我核对",
+      "result": {
+        "title": "核对数据并后天交付",
+        "timeEvidence": [
+          {
+            "quote": "后天交数据",
+            "meaning": "completion_deadline",
+            "precision": "day"
+          },
+          {
+            "quote": "明天早上提醒我核对",
+            "meaning": "reminder",
+            "precision": "period"
+          }
+        ],
+        "temporalIntent": "mixed",
+        "reminder": "2026-09-30T08:30:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "day",
+          "day": "2026-10-01",
+          "period": null,
+          "at": null,
+          "basis": "context_inferred",
+          "evidence": "后天交数据"
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.24
+    },
+    {
+      "id": 46,
+      "category": "混合",
+      "input": "今晚八点前确认结果，七点半提醒我",
+      "result": {
+        "title": "今晚八点前确认结果",
+        "timeEvidence": [
+          {
+            "quote": "今晚八点前",
+            "meaning": "completion_deadline",
+            "precision": "instant"
+          },
+          {
+            "quote": "七点半提醒我",
+            "meaning": "reminder",
+            "precision": "instant"
+          }
+        ],
+        "temporalIntent": "reminder",
+        "reminder": "2026-09-29T19:30:00+08:00",
+        "reminderBasis": "explicit",
+        "deadline": {
+          "kind": "instant",
+          "day": "2026-09-29",
+          "period": null,
+          "at": "2026-09-29T20:00:00+08:00",
+          "basis": "explicit",
+          "evidence": "今晚八点前"
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.2
+    },
+    {
+      "id": 47,
+      "category": "混合",
+      "input": "周五上线，下周一再提醒我检查结果",
+      "result": {
+        "title": "周五上线，下周一提醒检查结果",
+        "timeEvidence": [
+          {
+            "quote": "周五上线",
+            "meaning": "planned_action",
+            "precision": "day"
+          },
+          {
+            "quote": "下周一再提醒我检查结果",
+            "meaning": "reminder",
+            "precision": "day"
+          }
+        ],
+        "temporalIntent": "uncertain",
+        "reminder": null,
+        "reminderBasis": "uncertain",
+        "deadline": {
+          "kind": "day",
+          "day": "2026-10-02",
+          "period": null,
+          "at": null,
+          "basis": "context_inferred",
+          "evidence": "周五上线"
+        },
+        "suggestedCompletion": null,
+        "uncertainty": "包含两个不同日期、都需用户负责的行动：2026-10-02（周五）上线、2026-10-05（下周一）检查结果；单个 reminder 字段无法同时覆盖上线和事后检查，不能只安排较晚的检查提醒，也不能把上线日期静默遗漏；另外“下周一再提醒我检查结果”只有日期没有钟点，用户未指定具体提醒时刻。"
+      },
+      "seconds": 1.2
+    },
+    {
+      "id": 48,
+      "category": "歧义",
+      "input": "有空的时候提醒我看看合同",
+      "result": {
+        "title": "看看合同",
+        "timeEvidence": [
+          {
+            "quote": "有空的时候",
+            "meaning": "contextual_time",
+            "precision": "period"
+          }
+        ],
+        "temporalIntent": "uncertain",
+        "reminder": null,
+        "reminderBasis": "uncertain",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": "“有空的时候”是无法换算的模糊条件，无法确定具体提醒时刻"
+      },
+      "seconds": 0.86
+    },
+    {
+      "id": 49,
+      "category": "歧义",
+      "input": "晚点把资料给他",
+      "result": {
+        "title": "晚点把资料给他",
+        "timeEvidence": [
+          {
+            "quote": "晚点",
+            "meaning": "planned_action",
+            "precision": "period"
+          }
+        ],
+        "temporalIntent": "uncertain",
+        "reminder": null,
+        "reminderBasis": "uncertain",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": "“晚点”无法换算成具体时刻，不能可靠确定提醒时间"
+      },
+      "seconds": 1.14
+    },
+    {
+      "id": 50,
+      "category": "歧义",
+      "input": "下周找时间处理账单",
+      "result": {
+        "type": "json_object"
+      },
+      "seconds": 0.39
+    },
+    {
+      "id": 51,
+      "category": "歧义",
+      "input": "下周五还是周六找客户聊一下",
+      "result": {
+        "title": "下周五或周六找客户聊一下",
+        "timeEvidence": [
+          {
+            "quote": "下周五还是周六",
+            "meaning": "planned_action",
+            "precision": "day"
+          }
+        ],
+        "temporalIntent": "planned_action",
+        "reminder": "2026-10-02T10:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": "具体是哪一天（周五还是周六）以及几点未定；提醒时刻为我推断的上午10点"
+      },
+      "seconds": 0.99
+    },
+    {
+      "id": 52,
+      "category": "否定与修正",
+      "input": "今天不用做，明天再处理退款",
+      "result": {
+        "title": "明天处理退款",
+        "timeEvidence": [
+          {
+            "quote": "今天不用做",
+            "meaning": "contextual_time",
+            "precision": "day"
+          },
+          {
+            "quote": "明天再处理退款",
+            "meaning": "planned_action",
+            "precision": "day"
+          }
+        ],
+        "temporalIntent": "planned_action",
+        "reminder": null,
+        "reminderBasis": "no_time_default",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.11
+    },
+    {
+      "id": 53,
+      "category": "否定与修正",
+      "input": "不是今天发给客户，是后天再发",
+      "result": {
+        "title": "不是今天发给客户，是后天再发",
+        "timeEvidence": [
+          {
+            "quote": "不是今天",
+            "meaning": "planned_action",
+            "precision": "day"
+          },
+          {
+            "quote": "后天再发",
+            "meaning": "completion_deadline",
+            "precision": "day"
+          }
+        ],
+        "temporalIntent": "completion_deadline",
+        "reminder": "2026-10-01T09:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "day",
+          "day": "2026-10-01",
+          "period": null,
+          "at": null,
+          "basis": "context_inferred",
+          "evidence": "后天再发"
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 0.9
+    },
+    {
+      "id": 54,
+      "category": "否定与修正",
+      "input": "下周一前不用提醒，周二再联系供应商",
+      "result": {
+        "title": "周二联系供应商",
+        "timeEvidence": [
+          {
+            "quote": "下周一前不用提醒",
+            "meaning": "contextual_time",
+            "precision": "period"
+          },
+          {
+            "quote": "周二再联系供应商",
+            "meaning": "planned_action",
+            "precision": "day"
+          }
+        ],
+        "temporalIntent": "planned_action",
+        "reminder": "2026-10-06T10:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": "“周二”未指明确切日期，按紧随“下周一前”之后的2026-10-06处理；未给具体提醒钟点，10:00为推断值"
+      },
+      "seconds": 1.53
+    },
+    {
+      "id": 55,
+      "category": "否定与修正",
+      "input": "今天先别发报表，等明天确认后再说",
+      "result": {
+        "title": "今天不发报表，明天确认后再发",
+        "timeEvidence": [
+          {
+            "quote": "今天先别发报表",
+            "meaning": "contextual_time",
+            "precision": "day"
+          },
+          {
+            "quote": "等明天确认后再说",
+            "meaning": "planned_action",
+            "precision": "day"
+          }
+        ],
+        "temporalIntent": "uncertain",
+        "reminder": null,
+        "reminderBasis": "uncertain",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": "原话否定了今天的发送，但“明天确认后再说”的确认对象、确认方式与确认时点均未知，无法换算可靠提醒时刻；也未明确明天是否必须完成发送。"
+      },
+      "seconds": 1.09
+    },
+    {
+      "id": 56,
+      "category": "否定与修正",
+      "input": "明天十点前交的事取消了，后天再重新确认",
+      "result": {
+        "title": "取消明天十点前的交付，后天重新确认",
+        "timeEvidence": [
+          {
+            "quote": "明天十点前",
+            "meaning": "completion_deadline",
+            "precision": "instant"
+          },
+          {
+            "quote": "取消了",
+            "meaning": "contextual_time",
+            "precision": "instant"
+          },
+          {
+            "quote": "后天",
+            "meaning": "planned_action",
+            "precision": "day"
+          }
+        ],
+        "temporalIntent": "planned_action",
+        "reminder": "2026-10-01T10:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": "“后天重新确认”未说明具体钟点，提醒时刻为推断的上午10点"
+      },
+      "seconds": 1.2
+    },
+    {
+      "id": 57,
+      "category": "重复稳定性",
+      "input": "后天给阿姨买东西",
+      "result": {
+        "title": "后天给阿姨买东西",
+        "timeEvidence": [
+          {
+            "quote": "后天",
+            "meaning": "planned_action",
+            "precision": "day"
+          }
+        ],
+        "temporalIntent": "planned_action",
+        "reminder": "2026-10-01T10:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.07
+    },
+    {
+      "id": 58,
+      "category": "重复稳定性",
+      "input": "今天给领导一份报表",
+      "result": {
+        "title": "给领导一份报表",
+        "timeEvidence": [
+          {
+            "quote": "今天",
+            "meaning": "completion_deadline",
+            "precision": "day"
+          }
+        ],
+        "temporalIntent": "completion_deadline",
+        "reminder": "2026-09-29T12:55:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "day",
+          "day": "2026-09-29",
+          "period": null,
+          "at": null,
+          "basis": "context_inferred",
+          "evidence": "今天"
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 0.99
+    },
+    {
+      "id": 59,
+      "category": "重复稳定性",
+      "input": "明天下班前配置导出任务",
+      "result": {
+        "title": "配置导出任务",
+        "timeEvidence": [
+          {
+            "quote": "明天下班前",
+            "meaning": "completion_deadline",
+            "precision": "period"
+          }
+        ],
+        "temporalIntent": "completion_deadline",
+        "reminder": "2026-09-30T10:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "period",
+          "day": "2026-09-30",
+          "period": "下班前",
+          "at": null,
+          "basis": "explicit",
+          "evidence": "明天下班前"
+        },
+        "suggestedCompletion": null,
+        "uncertainty": "未说明具体下班时间，无法确定精确截止时刻；提醒钟点为按上午安排的推断值"
+      },
+      "seconds": 1.11
+    },
+    {
+      "id": 60,
+      "category": "重复稳定性",
+      "input": "晚上十点下班后买菜回家",
+      "result": {
+        "title": "下班后买菜回家",
+        "timeEvidence": [
+          {
+            "quote": "晚上十点下班后",
+            "meaning": "contextual_time",
+            "precision": "period"
+          },
+          {
+            "quote": "买菜回家",
+            "meaning": "planned_action",
+            "precision": "period"
+          }
+        ],
+        "temporalIntent": "planned_action",
+        "reminder": "2026-09-29T21:30:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": "“下班”为背景时间，未提供确切下班钟点；提醒时刻为便于下班后买到菜而推断，非用户指定"
+      },
+      "seconds": 1.09
+    },
+    {
+      "id": 61,
+      "category": "重复稳定性",
+      "input": "后天给阿姨买东西",
+      "result": {
+        "title": "给阿姨买东西",
+        "timeEvidence": [
+          {
+            "quote": "后天",
+            "meaning": "planned_action",
+            "precision": "day"
+          }
+        ],
+        "temporalIntent": "planned_action",
+        "reminder": "2026-10-01T10:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": null
+      },
+      "seconds": 1.19
+    },
+    {
+      "id": 62,
+      "category": "重复稳定性",
+      "input": "今天给领导一份报表",
+      "result": {
+        "title": "给领导一份报表",
+        "timeEvidence": [
+          {
+            "quote": "今天",
+            "meaning": "contextual_time",
+            "precision": "day"
+          }
+        ],
+        "temporalIntent": "completion_deadline",
+        "reminder": "2026-09-29T14:00:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "day",
+          "day": "2026-09-29",
+          "period": null,
+          "at": null,
+          "basis": "context_inferred",
+          "evidence": "今天"
+        },
+        "suggestedCompletion": null,
+        "uncertainty": "原话仅有“今天”这一日期范围，未给出具体钟点；已按同日较早时间推断提醒，但不是用户明确的提醒时刻"
+      },
+      "seconds": 1.38
+    },
+    {
+      "id": 63,
+      "category": "重复稳定性",
+      "input": "明天下班前配置导出任务",
+      "result": {
+        "title": "配置导出任务",
+        "timeEvidence": [
+          {
+            "quote": "明天",
+            "meaning": "planned_action",
+            "precision": "day"
+          },
+          {
+            "quote": "下班前",
+            "meaning": "completion_deadline",
+            "precision": "period"
+          }
+        ],
+        "temporalIntent": "completion_deadline",
+        "reminder": "2026-09-30T09:30:00+08:00",
+        "reminderBasis": "inferred",
+        "deadline": {
+          "kind": "period",
+          "day": "2026-09-30",
+          "period": "下班前",
+          "at": null,
+          "basis": "explicit",
+          "evidence": "明天下班前"
+        },
+        "suggestedCompletion": null,
+        "uncertainty": "“下班前”只限定时段，未给出具体钟点；提醒时刻 09:30 为推断，非用户指定。"
+      },
+      "seconds": 1.14
+    },
+    {
+      "id": 64,
+      "category": "重复稳定性",
+      "input": "晚上十点下班后买菜回家",
+      "result": {
+        "title": "晚上十点下班后买菜回家",
+        "timeEvidence": [
+          {
+            "quote": "晚上十点下班后",
+            "meaning": "planned_action",
+            "precision": "instant"
+          },
+          {
+            "quote": "晚上十点下班后",
+            "meaning": "contextual_time",
+            "precision": "instant"
+          }
+        ],
+        "temporalIntent": "planned_action",
+        "reminder": "2026-09-29T22:00:00+08:00",
+        "reminderBasis": "explicit",
+        "deadline": {
+          "kind": "none",
+          "day": null,
+          "period": null,
+          "at": null,
+          "basis": "none",
+          "evidence": null
+        },
+        "suggestedCompletion": null,
+        "uncertainty": "不详"
+      },
+      "seconds": 0.87
+    }
+  ]
+}
