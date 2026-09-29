@@ -45,13 +45,18 @@ final class SecretaryModel: ObservableObject {
         settings = try files.loadSettings()
     }
 
-    func update(_ item: ReminderItem) {
+    @discardableResult
+    func update(_ item: ReminderItem) -> Bool {
         do {
             try store.upsert(item)
             if let index = items.firstIndex(where: { $0.id == item.id }) { items[index] = item }
             else { items.insert(item, at: 0) }
             onItemsChanged?()
-        } catch { message = "本机保存失败：\(error.localizedDescription)" }
+            return true
+        } catch {
+            message = "本机保存失败：\(error.localizedDescription)"
+            return false
+        }
     }
 
     func add(_ input: String) {
@@ -115,26 +120,86 @@ final class SecretaryModel: ObservableObject {
         catch { message = "设置保存失败：\(error.localizedDescription)" }
     }
 
-    func edit(_ item: ReminderItem, text: String) {
-        var updated = item
+    // Validate the whole form before a single persisted update. The original capture is
+    // immutable; editing never starts another AI interpretation.
+    func editDetails(_ item: ReminderItem, title: String, text: String, reminder: Date?,
+                     deadline: Date?, deadlineDay: String?, clearPeriod: Bool,
+                     resolvesSingleAction: Bool, restoreSplit: Bool = false) -> Bool {
+        guard let current = items.first(where: { $0.id == item.id }) else { return false }
+        let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty, !text.isEmpty else { message = "标题和内容不能为空"; return false }
+        if current.needsSeparateEntries == true {
+            guard resolvesSingleAction, text != current.text, let reminder else {
+                message = "请先将内容核对为一件事、确认单项行动并设置新的提醒；或分开录入后取消原记录"
+                return false
+            }
+            guard reminder > .now else { message = "请选择将来的提醒时间"; return false }
+        }
+        var updated = current
+        updated.title = title
         updated.text = text
-        updated.manualVersion += 1
-        update(updated)
-        message = "内容已修改，提醒时间未变。请检查提醒时间。"
+        if restoreSplit && current.needsSeparateEntries == true { updated.status = .open }
+        updated.deadline = deadline
+        updated.deadlineDay = deadlineDay
+        if clearPeriod { updated.deadlinePeriod = nil; updated.deadlinePeriodDay = nil }
+        if let reminder, reminder != current.nextReminder || current.needsSeparateEntries == true {
+            if current.needsSeparateEntries == true { updated.needsSeparateEntries = false }
+            do { try updated.snooze(until: reminder, overrideDeadline: true) }
+            catch { message = error.localizedDescription; return false }
+        } else {
+            updated.nextReminder = reminder
+            updated.manualVersion += 1
+        }
+        guard update(updated) else { return false }
+        message = ""
+        return true
     }
 
-    func changeStatus(_ item: ReminderItem, to status: ItemStatus) {
-        var updated = item
+    @discardableResult
+    func changeStatus(_ item: ReminderItem, to status: ItemStatus) -> Bool {
+        guard let current = items.first(where: { $0.id == item.id }), current.status == .open else { return false }
+        var updated = current
         updated.status = status
         updated.manualVersion += 1
         if status != .open { updated.nextReminder = nil }
-        update(updated)
+        guard update(updated) else { return false }
+        message = ""
+        return true
     }
 
-    func snooze(_ item: ReminderItem, until date: Date, overrideDeadline: Bool = false) {
-        var updated = item
-        do { try updated.snooze(until: date, overrideDeadline: overrideDeadline); update(updated) }
-        catch { message = error.localizedDescription }
+    // Immediate undo restores the previous schedule without resurrecting an older AI result.
+    func undoStatus(_ previous: ReminderItem) -> Bool {
+        guard let current = items.first(where: { $0.id == previous.id }), current.status != .open else { return false }
+        var restored = previous
+        restored.manualVersion = current.manualVersion + 1
+        guard update(restored) else { return false }
+        message = ""
+        return true
+    }
+
+    @discardableResult
+    func snooze(_ item: ReminderItem, until date: Date, overrideDeadline: Bool = false) -> Bool {
+        guard let current = items.first(where: { $0.id == item.id }), current.status == .open else { return false }
+        var updated = current
+        do {
+            try updated.snooze(until: date, overrideDeadline: overrideDeadline)
+            guard update(updated) else { return false }
+            message = ""
+            return true
+        } catch { message = error.localizedDescription; return false }
+    }
+
+    func restore(_ item: ReminderItem, until date: Date) -> Bool {
+        guard let current = items.first(where: { $0.id == item.id }), current.status != .open else { return false }
+        var updated = current
+        updated.status = .open
+        do {
+            try updated.snooze(until: date, overrideDeadline: true)
+            guard update(updated) else { return false }
+            message = ""
+            return true
+        } catch { message = error.localizedDescription; return false }
     }
 
     func refreshPermission(requestIfUndetermined: Bool = false) {
@@ -260,6 +325,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
     private var feedbackToken: UUID?
     private var panel: CapturePanel?
     private var management: NSWindow?
+    private var managementWeb: ManagementWebHost?
     private var settingsWindow: NSWindow?
     private var timer: Timer?
     private var hotKey: EventHotKeyRef?
@@ -407,6 +473,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
                     window.orderOut(nil)
                     NSApp.terminate(nil)
                 }
+            }
+        }
+        if ProcessInfo.processInfo.arguments.contains("--check-management-ui") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                self?.showManagement()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5) { NSApp.terminate(nil) }
             }
         }
         if ProcessInfo.processInfo.arguments.contains("--check-management-window") {
@@ -574,12 +646,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
 
     private func presentManagement() {
         if management == nil {
-            management = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 620), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+            management = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1050, height: 650),
+                                  styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
+                                  backing: .buffered, defer: false)
             management?.isReleasedWhenClosed = false
             management?.title = "My Secretary · 事项"
-            management?.contentView = NSHostingView(rootView: ManagementView(model: model))
+            management?.titleVisibility = .hidden
+            management?.titlebarAppearsTransparent = true
+            management?.backgroundColor = NSColor(calibratedRed: 0.973, green: 0.980, blue: 0.984, alpha: 1)
             management?.center()
         }
+        if managementWeb == nil {
+            let host = ManagementWebHost(model: model, capture: { [weak self] in self?.showCapture() })
+            managementWeb = host
+            management?.contentView = host.webView
+        }
+        // Preserve the web view across routes; reset only its transient navigation.
+        managementWeb?.resetRoute()
         NSApp.activate(ignoringOtherApps: true)
         management?.makeKeyAndOrderFront(nil)
     }

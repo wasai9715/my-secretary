@@ -8,6 +8,11 @@ cp .build/release/MySecretary "$app/Contents/MacOS/MySecretary"
 # The installed app reads the packaged prompt from Resources, never from .build.
 rm -rf "$app/MySecretary_SecretaryCore.bundle"
 cp .build/release/MySecretary_SecretaryCore.bundle/interpretation-prompt.txt "$app/Contents/Resources/interpretation-prompt.txt"
+# SwiftPM executable resource bundle is not copied when only the binary is installed.
+# Install the SwiftPM-processed resource in the standard signed app Resources directory.
+# SwiftPM's bare .bundle has no Info.plist and cannot be nested as signed code.
+rm -rf "$app/Contents/MacOS/MySecretary_SecretaryMac.bundle" "$app/MySecretary_SecretaryMac.bundle"
+cp .build/release/MySecretary_SecretaryMac.bundle/management.html "$app/Contents/Resources/management.html"
 /usr/libexec/PlistBuddy -c 'Clear dict' "$app/Contents/Info.plist" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c 'Add :CFBundleIdentifier string com.mysecretary.mac' "$app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c 'Add :CFBundleName string MySecretary' "$app/Contents/Info.plist"

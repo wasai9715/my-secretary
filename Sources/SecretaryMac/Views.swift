@@ -1,6 +1,8 @@
 import SwiftUI
 import AppKit
 import SecretaryCore
+import WebKit
+import Combine
 
 struct CaptureView: View {
     @ObservedObject var model: SecretaryModel
@@ -156,126 +158,207 @@ struct CaptureFeedbackView: View {
     }
 }
 
-struct ManagementView: View {
-    @ObservedObject var model: SecretaryModel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(model.focusedNotificationIDs == nil ? "记下的事" : "这次提醒的事").font(.title2.bold())
-                    Text(model.focusedNotificationIDs == nil ? "到点再想，不必一直惦记" : "先处理本次通知关联的事项")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                Spacer()
-                if model.focusedNotificationIDs != nil {
-                    Button("查看全部") { model.focusedNotificationIDs = nil }
-                } else {
-                    Text("\(model.items.filter { $0.status == .open }.count) 未完成")
-                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                }
-            }
-            if !model.notificationGranted {
-                HStack {
-                    Label("通知未开启：到期事项不会弹出提醒", systemImage: "bell.slash")
-                        .font(.caption).foregroundStyle(.orange)
-                    Spacer()
-                    Button("打开通知设置") { SecretaryModel.openSystemNotificationSettings() }
-                }
-            }
-            if !model.message.isEmpty {
-                Text(model.message).font(.caption).foregroundStyle(.secondary)
-            }
-            List {
-                if let focused = model.focusedNotificationIDs {
-                    Section("本次通知 · \(focused.count) 件") {
-                        ForEach(model.items.filter { focused.contains($0.id) }) { item in
-                            ItemRow(model: model, item: item)
-                        }
-                    }
-                } else {
-                Section("现在需要处理") {
-                    ForEach(model.items.filter { $0.status == .open && ($0.recognition == .needsAttention || $0.nextReminder == nil || $0.nextReminder! <= .now) }) { item in
-                        ItemRow(model: model, item: item)
-                    }
-                }
-                Section("已安排稍后") {
-                    ForEach(model.items.filter { $0.status == .open && $0.recognition != .needsAttention && $0.nextReminder.map { $0 > .now } == true }) { item in
-                        ItemRow(model: model, item: item)
-                    }
-                }
-                Section("历史") {
-                    ForEach(model.items.filter { $0.status != .open }) { item in
-                        ItemRow(model: model, item: item)
-                    }
-                }
-                }
-            }
-        }.padding(16).frame(minWidth: 520, minHeight: 480)
+private final class WeakManagementHandler: NSObject, WKScriptMessageHandler {
+    weak var owner: ManagementWebHost?
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        owner?.userContentController(userContentController, didReceive: message)
     }
 }
 
-private struct ItemRow: View {
-    @ObservedObject var model: SecretaryModel
-    let item: ReminderItem
-    @State private var editing = false
-    @State private var newText = ""
-    @State private var newDate = Date().addingTimeInterval(900)
+// Keep the document alive for the lifetime of the management window. The document
+// owns transient filter/form state; persisted mutations are exclusively native.
+@MainActor
+final class ManagementWebHost: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
+    let webView: WKWebView
+    private let model: SecretaryModel
+    private let capture: () -> Void
+    private var observation: AnyCancellable?
+    private let handler = WeakManagementHandler()
+    private var loaded = false
+    private var pendingReset = false
+    private var undoItem: ReminderItem?
+    private var undoExpires: Date?
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack {
-                Text(item.title).font(.headline)
-                Spacer()
-                if item.recognition == .needsAttention { Text("待识别").foregroundStyle(.orange) }
-            }
-            Text(item.text).font(.subheadline).foregroundStyle(.secondary)
-            if let next = item.nextReminder { Text("下次提醒  \(next.formatted(date: .abbreviated, time: .shortened))").font(.caption.monospacedDigit()) }
-            if let deadline = item.deadline { Text("明确截止  \(deadline.formatted(date: .abbreviated, time: .shortened))").font(.caption).foregroundStyle(.red) }
-            if let day = item.deadlineDay { Text("截止日期  \(day)（未指定几点）").font(.caption).foregroundStyle(.red) }
-            if let period = item.deadlinePeriod {
-                Text("截止时段  \(item.deadlinePeriodDay.map { "\($0) " } ?? "")\(period)（未指定几点）")
-                    .font(.caption).foregroundStyle(.red)
-            }
-            if let suggestion = item.suggestedCompletion { Text("建议完成  \(suggestion.formatted(date: .abbreviated, time: .shortened))").font(.caption).foregroundStyle(.secondary) }
-            if let failure = item.failure { Text(failure).font(.caption).foregroundStyle(.red) }
-            if item.needsSeparateEntries == true {
-                Text("该原话尚未安排提醒；请分两次录入，并取消这条原记录。")
-                    .font(.caption).foregroundStyle(.orange)
-                Button("复制原话") { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(item.originalText, forType: .string) }
-                    .font(.caption)
-            }
-            HStack(spacing: 8) {
-                if item.status == .open {
-                    Button("完成") { model.changeStatus(item, to: .completed) }
-                    Button("不做了") { model.changeStatus(item, to: .cancelled) }
-                    if item.needsSeparateEntries != true {
-                        Button("15 分钟") { model.snooze(item, until: .now.addingTimeInterval(900)) }
-                        Button("30 分钟") { model.snooze(item, until: .now.addingTimeInterval(1800)) }
-                        Button("1 小时") { model.snooze(item, until: .now.addingTimeInterval(3600)) }
-                    }
-                    Button("修改") { newText = item.text; editing = true }
-                    Button("测试通知") {
-                        model.sendNotification(title: "测试提醒：\(item.title)", body: item.text, ids: [item.id])
-                    }
-                } else {
-                    Button("恢复并设为 15 分钟后") {
-                        var restored = item
-                        restored.status = .open
-                        model.snooze(restored, until: .now.addingTimeInterval(900))
-                    }
-                }
-            }.buttonStyle(.borderless).font(.caption)
-            if editing {
-                TextField("事项内容", text: $newText)
-                HStack {
-                    Button("保存内容") { model.edit(item, text: newText); editing = false }
-                    DatePicker("修改提醒", selection: $newDate, displayedComponents: [.date, .hourAndMinute])
-                    Button("设定") { model.snooze(item, until: newDate); editing = false }
-                }.font(.caption)
-            }
+    init(model: SecretaryModel, capture: @escaping () -> Void) {
+        self.model = model
+        self.capture = capture
+        let config = WKWebViewConfiguration()
+        config.defaultWebpagePreferences.allowsContentJavaScript = true
+        webView = WKWebView(frame: .zero, configuration: config)
+        super.init()
+        handler.owner = self
+        config.userContentController.add(handler, name: "management")
+        webView.navigationDelegate = self
+        webView.setValue(false, forKey: "drawsBackground")
+        observation = model.objectWillChange.sink { [weak self] _ in
+            DispatchQueue.main.async { [weak self] in self?.publish() }
         }
-        .padding(.vertical, 8)
+        if let url = Self.managementURL {
+            webView.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
+        } else {
+            model.message = "事项管理页面资源缺失"
+        }
+    }
+
+    func resetRoute() {
+        pendingReset = true
+        publish()
+    }
+
+    private static var managementURL: URL? {
+        Bundle.main.url(forResource: "management", withExtension: "html") ??
+            Bundle.module.url(forResource: "management", withExtension: "html")
+    }
+
+    private func local(_ date: Date?) -> String? {
+        guard let date else { return nil }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm"
+        return formatter.string(from: date)
+    }
+
+    private func parse(_ value: String?) -> Date? {
+        guard let value, !value.isEmpty else { return nil }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm"
+        formatter.isLenient = false
+        guard let date = formatter.date(from: value), formatter.string(from: date) == value else { return nil }
+        return date
+    }
+
+    private func safeMessage(_ message: String) -> String {
+        if message.isEmpty { return "操作未完成，请重试" }
+        let token = model.configuration.token
+        if !token.isEmpty && message.contains(token) { return "操作未完成，请检查连接设置" }
+        return message
+    }
+
+    private func json(_ value: Any) -> String? {
+        guard let data = try? JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed, .sortedKeys]) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    private func evaluate(_ function: String, _ value: Any) {
+        guard loaded, let encoded = json(value) else { return }
+        webView.evaluateJavaScript("window.\(function)(\(encoded))", completionHandler: nil)
+    }
+
+    private func publish() {
+        guard loaded else { return }
+        let snapshot: [[String: Any]] = model.items.map { item in
+            ["id": item.id.uuidString, "title": item.title, "original": item.originalText,
+             "text": item.text, "status": item.status.rawValue, "recognition": item.recognition.rawValue,
+             "reminder": local(item.nextReminder) as Any? ?? NSNull(),
+             "deadline": local(item.deadline) as Any? ?? NSNull(),
+             "deadlineDay": item.deadlineDay as Any? ?? NSNull(),
+             "period": item.deadlinePeriod as Any? ?? NSNull(),
+             "periodDay": item.deadlinePeriodDay as Any? ?? NSNull(),
+             "suggestion": local(item.suggestedCompletion) as Any? ?? NSNull(),
+             "failure": item.failure.map(safeMessage) as Any? ?? NSNull(),
+             "split": item.needsSeparateEntries == true,
+             "attention": item.recognition == .needsAttention,
+             "created": item.createdAt.timeIntervalSince1970 * 1000]
+        }
+        // Never include configuration or credentials, even in error messages.
+        let state: [String: Any] = ["items": snapshot,
+            "focus": model.focusedNotificationIDs.map { $0.map(\.uuidString) } as Any? ?? NSNull(),
+            "permission": model.notificationGranted,
+            "message": model.message.isEmpty ? "" : safeMessage(model.message),
+            "presets": model.settings.presetsMinutes,
+            "reset": pendingReset]
+        pendingReset = false
+        evaluate("managementState", state)
+    }
+
+    private func result(_ action: String, error: String? = nil, undo: ReminderItem? = nil) {
+        var response: [String: Any] = ["action": action]
+        if let error { response["error"] = error }
+        if let undo { response["undo"] = ["id": undo.id.uuidString, "status": action == "cancel" ? "cancelled" : "completed"] }
+        publish()
+        evaluate("managementResult", response)
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        loaded = true
+        publish()
+    }
+
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void) {
+        // Only the bundled document may load; disallow links, forms and all network requests.
+        decisionHandler(navigationAction.navigationType == .other &&
+            navigationAction.request.url == Self.managementURL ? .allow : .cancel)
+    }
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard message.frameInfo.isMainFrame, message.name == "management",
+              let body = message.body as? [String: Any], let action = body["action"] as? String else { return }
+        if action == "ready" { loaded = true; publish(); return }
+        if action == "add" { capture(); return }
+        if action == "all" { model.focusedNotificationIDs = nil; resetRoute(); return }
+        if action == "permission" { SecretaryModel.openSystemNotificationSettings(); return }
+        guard let rawID = body["id"] as? String, let id = UUID(uuidString: rawID),
+              let item = model.items.first(where: { $0.id == id }) else { return }
+        if action == "copy" {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(item.originalText, forType: .string)
+            return
+        }
+        if action == "undo" {
+            guard undoItem?.id == id, let undoExpires, undoExpires > .now else { result(action, error: "撤销时间已结束"); return }
+            let success = model.undoStatus(undoItem!)
+            if success { undoItem = nil; self.undoExpires = nil }
+            result(action, error: success ? nil : safeMessage(model.message))
+            return
+        }
+        if action == "complete" || action == "cancel" {
+            guard model.changeStatus(item, to: action == "complete" ? .completed : .cancelled) else {
+                result(action, error: safeMessage(model.message)); return
+            }
+            undoItem = item
+            undoExpires = Date().addingTimeInterval(7)
+            result(action, undo: item)
+            return
+        }
+        if action == "snooze" || action == "restore" {
+            guard let value = body["reminder"] as? String, let when = parse(value), when > .now else {
+                result(action, error: "请选择将来的有效提醒时间"); return
+            }
+            let success = action == "restore" ? model.restore(item, until: when) : model.snooze(item, until: when, overrideDeadline: true)
+            result(action, error: success ? nil : safeMessage(model.message))
+            return
+        }
+        if action == "edit" {
+            guard let title = body["title"] as? String, let text = body["text"] as? String,
+                  let reminderValue = body["reminder"] as? String else { return }
+            let reminder = reminderValue.isEmpty ? nil : parse(reminderValue)
+            guard reminderValue.isEmpty || reminder != nil else { result(action, error: "提醒时间无效"); return }
+            let deadlineValue = body["deadline"] as? String
+            let exact = deadlineValue?.contains("T") == true
+            let deadline = exact ? parse(deadlineValue) : nil
+            let day = exact ? nil : deadlineValue
+            guard !exact || deadline != nil,
+                  day == nil || (day?.isEmpty == true || ReminderItem.endOfLocalDay(day!) != nil) else {
+                result(action, error: "截止日期无效"); return
+            }
+            let unchangedReminder = reminderValue == local(item.nextReminder)
+            guard reminder == nil || unchangedReminder || reminder! > .now else {
+                result(action, error: "请选择将来的提醒时间"); return
+            }
+            let success = model.editDetails(item, title: title, text: text,
+                reminder: unchangedReminder ? item.nextReminder : reminder,
+                deadline: deadline, deadlineDay: day?.isEmpty == false ? day : nil,
+                clearPeriod: body["clearPeriod"] as? Bool ?? false,
+                resolvesSingleAction: body["single"] as? Bool ?? false,
+                restoreSplit: item.status != .open && item.needsSeparateEntries == true)
+            result(action, error: success ? nil : safeMessage(model.message))
+        }
     }
 }
 
@@ -291,6 +374,8 @@ struct SettingsView: View {
     @State private var token = ""
     @State private var showAdvanced = false
     @State private var testing = false
+    @State private var presetsInput = ""
+    @State private var presetError = ""
 
     var body: some View {
         Form {
@@ -353,6 +438,22 @@ struct SettingsView: View {
             }
             Section("提醒") {
                 HStack {
+                    TextField("推迟预设（分钟，逗号分隔）", text: $presetsInput)
+                        .frame(maxWidth: 250)
+                    Button("保存预设") {
+                        let values = presetsInput.split(separator: ",", omittingEmptySubsequences: false)
+                            .map { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+                        guard (1...5).contains(values.count), values.allSatisfy({ $0.map { (1...1440).contains($0) } == true }) else {
+                            presetError = "请输入 1–5 个 1 到 1440 的分钟数，逗号分隔"
+                            return
+                        }
+                        model.settings.presetsMinutes = values.compactMap { $0 }
+                        model.saveSettings()
+                        presetError = ""
+                    }
+                }
+                if !presetError.isEmpty { Text(presetError).font(.caption).foregroundStyle(.red) }
+                HStack {
                     Text("每日汇总")
                     Picker("时", selection: $model.settings.digestHour) { ForEach(0..<24) { Text("\($0) 时").tag($0) } }.frame(width: 95)
                     Picker("分", selection: $model.settings.digestMinute) { ForEach(0..<60) { Text("\($0) 分").tag($0) } }.frame(width: 95)
@@ -375,6 +476,7 @@ struct SettingsView: View {
             endpoint = model.configuration.endpoint
             name = model.configuration.model
             token = model.configuration.token
+            presetsInput = model.settings.presetsMinutes.map(String.init).joined(separator: ", ")
         }
         .frame(minWidth: 480, minHeight: 360)
     }
