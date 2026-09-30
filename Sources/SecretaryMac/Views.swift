@@ -381,106 +381,171 @@ struct SettingsView: View {
     @State private var presetError = ""
 
     var body: some View {
-        Form {
-            Section("智能识别 · DeepSeek") {
-                SecureField("API Token", text: $token)
-                DisclosureGroup("高级设置", isExpanded: $showAdvanced) {
-                    TextField("API 地址", text: $endpoint)
-                    TextField("模型", text: $name)
-                }
-                HStack {
-                    Button(testing ? "正在测试…" : "测试连接并保存") {
-                        testing = true
-                        Task {
-                            await model.testAndSave(endpoint: endpoint, model: name, token: token)
-                            testing = false
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                settingsSection("智能识别", subtitle: "DeepSeek 用于理解事项和安排提醒") {
+                    labeledField("API Token") {
+                        SecureField("输入 API Token", text: $token)
+                            .textFieldStyle(.roundedBorder)
+                    }
+                    DisclosureGroup("高级设置", isExpanded: $showAdvanced) {
+                        VStack(alignment: .leading, spacing: 12) {
+                            labeledField("API 地址") { TextField("API 地址", text: $endpoint) }
+                            labeledField("模型") { TextField("模型", text: $name) }
                         }
-                    }.disabled(testing || token.isEmpty)
-                    Text(model.configuration.verified ? "连接已验证" : "连接成功后可开始录入")
-                        .foregroundStyle(.secondary)
+                        .textFieldStyle(.roundedBorder)
+                        .padding(.top, 8)
+                    }
+                    .font(.subheadline)
+                    HStack(spacing: 12) {
+                        Button(testing ? "正在测试…" : "测试连接并保存") {
+                            testing = true
+                            Task {
+                                await model.testAndSave(endpoint: endpoint, model: name, token: token)
+                                testing = false
+                            }
+                        }.disabled(testing || token.isEmpty)
+                        Label(model.configuration.verified ? "连接已验证" : "连接成功后可开始录入",
+                              systemImage: model.configuration.verified ? "checkmark.circle.fill" : "info.circle")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                 }
-            }
-            Section("快捷录入") {
-                HStack {
-                    Text("当前快捷键")
-                    Spacer()
-                    Text(model.settings.shortcutDisplay ?? RecordedShortcut.label(
-                        keyCode: model.settings.shortcutKey,
-                        modifiers: model.settings.shortcutModifiers))
-                        .font(.system(.body, design: .monospaced)).foregroundStyle(.secondary)
-                }
-                HStack {
-                    if isRecordingShortcut {
-                        Text("按下你想使用的组合键…  Esc 取消")
-                            .foregroundStyle(.blue)
-                        ShortcutRecorder(recorded: $recordedShortcut, isRecording: $isRecordingShortcut,
-                            onFinished: restoreShortcut)
-                            .frame(width: 1, height: 28)
-                        Button("取消") {
-                            isRecordingShortcut = false
-                            recordedShortcut = nil
-                            restoreShortcut()
-                        }
-                    } else {
-                        Button("录制快捷键") {
-                            recordedShortcut = nil
-                            suspendShortcut()
-                            isRecordingShortcut = true
-                        }
-                        if let recordedShortcut {
-                            Text("待应用：\(recordedShortcut.display)")
-                                .font(.system(.caption, design: .monospaced))
-                            Button("应用") {
-                                if applyShortcut(recordedShortcut) { self.recordedShortcut = nil }
+                settingsSection("快捷录入", subtitle: "在任意位置快速记下一件事") {
+                    HStack {
+                        Text("当前快捷键").foregroundStyle(.secondary)
+                        Spacer()
+                        Text(model.settings.shortcutDisplay ?? RecordedShortcut.label(
+                            keyCode: model.settings.shortcutKey,
+                            modifiers: model.settings.shortcutModifiers))
+                            .font(.system(.body, design: .monospaced))
+                    }
+                    HStack(spacing: 10) {
+                        if isRecordingShortcut {
+                            Text("按下你想使用的组合键…  Esc 取消")
+                                .foregroundStyle(.blue)
+                            ShortcutRecorder(recorded: $recordedShortcut, isRecording: $isRecordingShortcut,
+                                onFinished: restoreShortcut)
+                                .frame(width: 1, height: 28)
+                            Button("取消") {
+                                isRecordingShortcut = false
+                                recordedShortcut = nil
+                                restoreShortcut()
+                            }
+                        } else {
+                            Button("录制快捷键") {
+                                recordedShortcut = nil
+                                suspendShortcut()
+                                isRecordingShortcut = true
+                            }
+                            if let recordedShortcut {
+                                Text("待应用：\(recordedShortcut.display)")
+                                    .font(.system(.caption, design: .monospaced))
+                                Button("应用") {
+                                    if applyShortcut(recordedShortcut) { self.recordedShortcut = nil }
+                                }
                             }
                         }
                     }
+                    Text("按修饰键（⌘ / ⌃ / ⌥）和其他按键。如果组合键已被占用，旧快捷键会保留。")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                Text("录制时按至少一个修饰键（⌘／⌃／⌥）加其他按键；若系统或其他应用占用，旧快捷键会保留。")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            Section("提醒") {
-                HStack {
-                    TextField("推迟预设（分钟，逗号分隔）", text: $presetsInput)
-                        .frame(maxWidth: 250)
-                    Button("保存预设") {
-                        let values = presetsInput.split(separator: ",", omittingEmptySubsequences: false)
-                            .map { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
-                        guard (1...5).contains(values.count), values.allSatisfy({ $0.map { (1...1440).contains($0) } == true }) else {
-                            presetError = "请输入 1–5 个 1 到 1440 的分钟数，逗号分隔"
-                            return
+                settingsSection("提醒", subtitle: "设置推迟提醒和每日汇总的时间") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("推迟预设").font(.subheadline.weight(.medium))
+                        HStack(spacing: 10) {
+                            TextField("例如 15, 30, 60", text: $presetsInput)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(maxWidth: 220)
+                            Text("分钟，逗号分隔")
+                                .font(.caption).foregroundStyle(.secondary)
+                            Spacer(minLength: 0)
+                            Button("保存预设") {
+                                let values = presetsInput.split(separator: ",", omittingEmptySubsequences: false)
+                                    .map { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+                                guard (1...5).contains(values.count),
+                                      values.allSatisfy({ $0.map { (1...1440).contains($0) } == true }) else {
+                                    presetError = "请输入 1–5 个 1 到 1440 的分钟数，逗号分隔"
+                                    return
+                                }
+                                model.settings.presetsMinutes = values.compactMap { $0 }
+                                model.saveSettings()
+                                presetError = ""
+                            }
                         }
-                        model.settings.presetsMinutes = values.compactMap { $0 }
-                        model.saveSettings()
-                        presetError = ""
+                        if !presetError.isEmpty { Text(presetError).font(.caption).foregroundStyle(.red) }
+                    }
+                    Divider()
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("每日汇总").font(.subheadline.weight(.medium))
+                        HStack(spacing: 8) {
+                            Picker("时", selection: $model.settings.digestHour) { ForEach(0..<24) { Text("\($0) 时").tag($0) } }
+                                .frame(width: 96)
+                            Picker("分", selection: $model.settings.digestMinute) { ForEach(0..<60) { Text("\($0) 分").tag($0) } }
+                                .frame(width: 96)
+                            Spacer(minLength: 0)
+                            Button("保存时间") { model.saveSettings() }
+                        }
+                    }
+                    Divider()
+                    VStack(alignment: .leading, spacing: 7) {
+                        HStack {
+                            Text("通知权限").font(.subheadline.weight(.medium))
+                            Spacer()
+                            Button(model.notificationGranted ? "检查通知状态" : "打开通知设置") { model.requestPermission() }
+                        }
+                        Text(model.notificationGranted
+                             ? "通知已开启。如果没有收到提醒，请检查系统的勿扰和横幅设置。"
+                             : "如果曾拒绝通知，请在系统设置 → 通知 → MySecretary 中开启。")
+                            .font(.caption).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
-                if !presetError.isEmpty { Text(presetError).font(.caption).foregroundStyle(.red) }
-                HStack {
-                    Text("每日汇总")
-                    Picker("时", selection: $model.settings.digestHour) { ForEach(0..<24) { Text("\($0) 时").tag($0) } }.frame(width: 95)
-                    Picker("分", selection: $model.settings.digestMinute) { ForEach(0..<60) { Text("\($0) 分").tag($0) } }.frame(width: 95)
-                    Button("保存") { model.saveSettings() }
+                if !model.message.isEmpty {
+                    Text(model.message).font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                Button(model.notificationGranted ? "检查通知状态" : "开启通知（前往系统设置）") { model.requestPermission() }
-                Text("如果曾拒绝通知，macOS 不会再次弹出授权框；请在系统设置 → 通知 → MySecretary 中开启。")
-                    .font(.caption).foregroundStyle(.secondary)
             }
-            if !model.message.isEmpty { Text(model.message).font(.caption).foregroundStyle(.secondary) }
+            .frame(maxWidth: 540, alignment: .leading)
+            .padding(.horizontal, 32)
+            .padding(.vertical, 28)
+            .frame(maxWidth: .infinity)
         }
+        .background(Color(red: 0.965, green: 0.965, blue: 0.973))
         .onDisappear {
             if isRecordingShortcut {
                 isRecordingShortcut = false
                 restoreShortcut()
             }
         }
-        .padding(24)
         .onAppear {
             endpoint = model.configuration.endpoint
             name = model.configuration.model
             token = model.configuration.token
             presetsInput = model.settings.presetsMinutes.map(String.init).joined(separator: ", ")
         }
-        .frame(minWidth: 480, minHeight: 360)
+        .frame(minWidth: 580, minHeight: 490)
+    }
+
+    private func settingsSection<Content: View>(_ title: String, subtitle: String,
+                                                  @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title).font(.headline)
+                Text(subtitle).font(.caption).foregroundStyle(.secondary)
+            }
+            VStack(alignment: .leading, spacing: 14, content: content)
+                .padding(18)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(.background, in: RoundedRectangle(cornerRadius: 10))
+                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.primary.opacity(0.07)))
+        }
+    }
+
+    private func labeledField<Content: View>(_ label: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(label).font(.subheadline.weight(.medium))
+            content()
+        }
     }
 }
