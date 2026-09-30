@@ -10,7 +10,7 @@ struct CaptureView: View {
     @State private var text = ""
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 13) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Image(systemName: "text.badge.plus").foregroundStyle(.tint)
                 Text("记下一件事").font(.headline)
@@ -22,8 +22,11 @@ struct CaptureView: View {
                 dismiss()
             }, cancel: dismiss)
                 .frame(height: 28)
+                .overlay(RoundedRectangle(cornerRadius: 7)
+                    .strokeBorder(Color.accentColor.opacity(0.55), lineWidth: 1.5))
         }
-        .padding(18)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
     }
 }
 
@@ -51,6 +54,7 @@ private struct FocusedCaptureField: NSViewRepresentable {
         let field = CaptureTextControl()
         field.placeholderString = "例如：明天 10 点前给领导数据"
         field.bezelStyle = .roundedBezel
+        field.focusRingType = .none // The subtler SwiftUI outline above indicates focus.
         field.isEditable = true
         field.isSelectable = true
         field.font = .systemFont(ofSize: NSFont.systemFontSize)

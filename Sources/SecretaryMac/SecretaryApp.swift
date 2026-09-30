@@ -648,7 +648,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
         let screen = NSScreen.main ?? NSScreen.screens.first
         feedbackScreen = screen
         let frame = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 900, height: 600)
-        let rect = NSRect(x: frame.midX - 240, y: frame.midY + 30, width: 480, height: 130)
+        let rect = NSRect(x: frame.midX - 220, y: frame.midY + 30, width: 440, height: 106)
         if panel == nil {
             let window = CapturePanel(contentRect: rect, styleMask: [.titled, .fullSizeContentView, .nonactivatingPanel], backing: .buffered, defer: false)
             window.onCancel = { [weak self] in
