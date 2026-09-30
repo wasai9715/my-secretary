@@ -1,5 +1,6 @@
 import Foundation
 import SecretaryCore
+import CSQLite3
 
 func check(_ value: @autoclosure () throws -> Bool, _ label: String) throws {
     guard try value() else { throw RecognitionError.invalid("校验失败：\(label)") }
@@ -58,6 +59,65 @@ func run() throws {
     let oldDecoded = try JSONDecoder().decode(ReminderItem.self, from: JSONSerialization.data(withJSONObject: legacyPayload))
     try check(oldDecoded.id == item.id && oldDecoded.deadlinePeriod == nil && oldDecoded.needsSeparateEntries == nil,
               "旧版事项不含新字段仍可恢复")
+    // Exercise migration from actual persisted legacy rows, not just an in-memory decode.
+    let legacyPath = directory.appendingPathComponent("legacy.sqlite3").path
+    let legacyStore = try ItemStore(path: legacyPath)
+    try legacyStore.upsert(item)
+    var legacyDB: OpaquePointer?
+    guard sqlite3_open(legacyPath, &legacyDB) == SQLITE_OK else { throw RecognitionError.invalid("无法建立迁移测试数据库") }
+    let legacyJSON = try JSONSerialization.data(withJSONObject: legacyPayload)
+    var legacyStatement: OpaquePointer?
+    guard sqlite3_prepare_v2(legacyDB, "UPDATE items SET payload=? WHERE id=?", -1, &legacyStatement, nil) == SQLITE_OK else {
+        sqlite3_close(legacyDB)
+        throw RecognitionError.invalid("无法准备旧数据")
+    }
+    let legacyBind = legacyJSON.withUnsafeBytes { sqlite3_bind_blob(legacyStatement, 1, $0.baseAddress, Int32(legacyJSON.count), unsafeBitCast(-1, to: sqlite3_destructor_type.self)) }
+    let legacyID = item.id.uuidString
+    let idBind = legacyID.withCString { sqlite3_bind_text(legacyStatement, 2, $0, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self)) }
+    let legacyStep = legacyBind == SQLITE_OK && idBind == SQLITE_OK ? sqlite3_step(legacyStatement) : SQLITE_ERROR
+    sqlite3_finalize(legacyStatement)
+    sqlite3_close(legacyDB)
+    try check(legacyStep == SQLITE_DONE, "构造磁盘旧版本事项")
+    let migratedItem = try ItemStore(path: legacyPath).all().first
+    try check(migratedItem?.id == item.id && migratedItem?.nextReminder == item.nextReminder && migratedItem?.notificationsSent == item.notificationsSent,
+              "旧版本事项磁盘重开保留提醒状态")
+    let previous = try legacyStore.all().first!
+    var updated = previous
+    updated.notificationsSent = 2
+    updated.nextReminder = now.addingTimeInterval(7200)
+    try legacyStore.upsert(updated)
+    let persistedUpdate = try ItemStore(path: legacyPath).all().first
+    try check(persistedUpdate?.notificationsSent == 2 && persistedUpdate?.nextReminder == updated.nextReminder,
+              "提醒轮次与下次提醒同一记录原子更新")
+    var blockedDB: OpaquePointer?
+    guard sqlite3_open(legacyPath, &blockedDB) == SQLITE_OK else { throw RecognitionError.invalid("无法准备原子失败测试") }
+    let trigger = sqlite3_exec(blockedDB, "CREATE TRIGGER block_update BEFORE UPDATE ON items BEGIN SELECT RAISE(ABORT, 'test abort'); END", nil, nil, nil)
+    sqlite3_close(blockedDB)
+    try check(trigger == SQLITE_OK, "准备写入中断测试")
+    updated.notificationsSent = 3
+    updated.nextReminder = nil
+    do {
+        try legacyStore.upsert(updated)
+        throw RecognitionError.invalid("写入中断未报告错误")
+    } catch RecognitionError.connection { print("✓ 写入中断显式报错") }
+    let afterAbort = try ItemStore(path: legacyPath).all().first
+    try check(afterAbort?.notificationsSent == 2 && afterAbort?.nextReminder == persistedUpdate?.nextReminder,
+              "写入失败后轮次与时间均保留旧值")
+
+    let corruptPath = directory.appendingPathComponent("corrupt.sqlite3").path
+    let corruptStore = try ItemStore(path: corruptPath)
+    try corruptStore.upsert(item)
+    var corruptDB: OpaquePointer?
+    guard sqlite3_open(corruptPath, &corruptDB) == SQLITE_OK else { throw RecognitionError.invalid("无法建立损坏测试数据库") }
+    let corruptStep = sqlite3_exec(corruptDB, "UPDATE items SET payload=x'7b'", nil, nil, nil)
+    sqlite3_close(corruptDB)
+    try check(corruptStep == SQLITE_OK, "构造损坏的事项记录")
+    do {
+        _ = try ItemStore(path: corruptPath).all()
+        throw RecognitionError.invalid("损坏数据被当作空列表")
+    } catch RecognitionError.connection(let message) {
+        try check(message.contains("数据损坏") && message.contains(item.id.uuidString), "损坏事项明确报错而非静默丢失")
+    }
 
     let clicked = now.addingTimeInterval(1200)
     do {
@@ -104,6 +164,26 @@ func run() throws {
         try check(interpretation.scheduledDay == plannedDay && interpretation.reminder == tomorrow,
                   "计划日期由模型提供，程序不匹配明天关键词")
     default: throw RecognitionError.invalid("有效单行动未安排")
+    }
+    do {
+        _ = try DeepSeekClient.decodeInterpretation("not JSON", originalText: futureText, now: now)
+        throw RecognitionError.invalid("无效 JSON 被接受")
+    } catch RecognitionError.invalid(let reason) {
+        try check(reason.contains("结构"), "无效 JSON 被通用结构校验拒绝")
+    }
+    var invalidDate = futureAction
+    invalidDate["reminderAt"] = "2027-02-30T09:00:00+08:00"
+    do {
+        _ = try DeepSeekClient.decodeInterpretation(payload([invalidDate]), originalText: futureText, now: now)
+        throw RecognitionError.invalid("非法日历日期被接受")
+    } catch RecognitionError.invalid { print("✓ 非法日历日期被拒绝") }
+    var invalidEvidence = futureAction
+    invalidEvidence["actionEvidence"] = "原话中不存在的语句"
+    do {
+        _ = try DeepSeekClient.decodeInterpretation(payload([invalidEvidence]), originalText: futureText, now: now)
+        throw RecognitionError.invalid("虚构出处被接受")
+    } catch RecognitionError.invalid(let reason) {
+        try check(reason.contains("依据"), "出处必须为原话连续片段")
     }
     var absent = futureAction
     absent["reminderAt"] = NSNull()
@@ -199,6 +279,69 @@ func run() throws {
     var failed = ReminderItem(text: "明天给数据", now: now)
     failed.fail("请求失败", now: now)
     try check(failed.recognition == .needsAttention && failed.nextReminder == now.addingTimeInterval(900), "待识别与默认提醒区分")
+
+    let dueAt = now.addingTimeInterval(900)
+    var scheduled = ReminderItem(text: "需要三轮提醒", now: now)
+    try scheduled.apply(.init(title: "三轮提醒", reminder: dueAt, deadline: nil, suggestedCompletion: nil), now: now)
+    try check(ReminderSchedule.due([scheduled], at: dueAt.addingTimeInterval(-1)).isEmpty, "未到期不派发")
+    try check(ReminderSchedule.due([scheduled], at: dueAt).count == 1, "首次到期")
+    let firstSent = ReminderSchedule.afterDispatch(scheduled, at: dueAt)
+    try check(firstSent.notificationsSent == 1 && firstSent.nextReminder == dueAt.addingTimeInterval(1800), "首次真实派发后30分钟重试")
+    let secondAt = firstSent.nextReminder!
+    let secondSent = ReminderSchedule.afterDispatch(firstSent, at: secondAt)
+    try check(secondSent.notificationsSent == 2 && secondSent.nextReminder == secondAt.addingTimeInterval(7200), "第二次真实派发后2小时重试")
+    let thirdSent = ReminderSchedule.afterDispatch(secondSent, at: secondSent.nextReminder!)
+    try check(thirdSent.notificationsSent == 3 && thirdSent.nextReminder == nil && thirdSent.status == .open, "第三次派发后停止单条重试但保留未完成")
+    var postponed = thirdSent
+    try postponed.snooze(until: secondAt.addingTimeInterval(900), now: secondAt)
+    try check(postponed.notificationsSent == 0 && postponed.nextReminder == secondAt.addingTimeInterval(900), "主动推迟新轮次从操作时起算")
+    var pendingRecognition = failed
+    try check(ReminderSchedule.due([pendingRecognition], at: now.addingTimeInterval(900)).count == 1, "待识别15分钟提示")
+    pendingRecognition = ReminderSchedule.afterDispatch(pendingRecognition, at: now.addingTimeInterval(900))
+    try check(pendingRecognition.notificationsSent == 1 && pendingRecognition.nextReminder == nil, "待识别提示不反复发送")
+    var digestCalendar = Calendar(identifier: .gregorian)
+    digestCalendar.timeZone = TimeZone(secondsFromGMT: 0)!
+    var digestSettings = ReminderSettings()
+    let firstDigest = digestCalendar.date(from: DateComponents(year: 2026, month: 10, day: 1, hour: 17, minute: 0))!
+    try check(!ReminderSchedule.shouldSendDigest(at: firstDigest.addingTimeInterval(-60), settings: digestSettings, calendar: digestCalendar) &&
+              ReminderSchedule.shouldSendDigest(at: firstDigest, settings: digestSettings, calendar: digestCalendar),
+              "每日默认17:00到点才汇总")
+    digestSettings.lastDigestDay = ReminderSchedule.digestDay(at: firstDigest, calendar: digestCalendar)
+    try check(!ReminderSchedule.shouldSendDigest(at: firstDigest.addingTimeInterval(3600), settings: digestSettings, calendar: digestCalendar) &&
+              ReminderSchedule.shouldSendDigest(at: firstDigest.addingTimeInterval(24 * 3600), settings: digestSettings, calendar: digestCalendar),
+              "同日只汇总一次，隔日继续")
+    digestSettings.digestHour = 9
+    digestSettings.digestMinute = 35
+    try check(ReminderSchedule.shouldSendDigest(at: firstDigest.addingTimeInterval(24 * 3600 - 7 * 3600 - 25 * 60), settings: digestSettings, calendar: digestCalendar),
+              "自定义每日时分生效")
+    let digestAt = dueAt.addingTimeInterval(6 * 3600)
+    var futureSnoozed = scheduled
+    try futureSnoozed.snooze(until: digestAt.addingTimeInterval(24 * 3600), now: dueAt)
+    try check(ReminderSchedule.digestPending([scheduled, futureSnoozed, pendingRecognition], at: digestAt).map(\.id) == [scheduled.id, pendingRecognition.id],
+              "每日汇总排除未来主动推迟，保留已到期与待识别")
+    try check(ReminderSchedule.digestPending([scheduled, pendingRecognition], at: digestAt.addingTimeInterval(24 * 3600)).count == 2,
+              "跨日汇总仍包含未处理事项")
+    let reopened = dueAt.addingTimeInterval(2 * 24 * 3600)
+    var other = ReminderItem(text: "另一个逾期事项", now: now)
+    try other.apply(.init(title: "另一个", reminder: dueAt, deadline: nil, suggestedCompletion: nil), now: now)
+    let catchUp = ReminderSchedule.due([scheduled, other], at: reopened)
+    try check(catchUp.count == 2 && catchUp.allSatisfy { $0.notificationsSent == 0 }, "退出两天未虚算提醒轮次")
+    let caughtUp = catchUp.map { ReminderSchedule.afterDispatch($0, at: reopened) }
+    try check(caughtUp.allSatisfy { $0.notificationsSent == 1 && $0.nextReminder == reopened.addingTimeInterval(1800) } &&
+              ReminderSchedule.due(caughtUp, at: reopened).isEmpty, "重开只合并当前到期项一次，不补历史轮次")
+    var six: [ReminderItem] = []
+    for index in 1...6 {
+        var entry = ReminderItem(text: "原话 \(index)", now: now)
+        try entry.apply(.init(title: "事项\(index)", reminder: dueAt, deadline: nil, suggestedCompletion: nil), now: now)
+        six.append(entry)
+    }
+    let mixed = [firstSent, other] + six
+    let mixedDue = ReminderSchedule.due(mixed, at: firstSent.nextReminder!)
+    try check(mixedDue.count == 8 && Set(mixedDue.map(\.id)).count == 8 &&
+              mixedDue.contains(where: { $0.notificationsSent == 1 }) && mixedDue.contains(where: { $0.notificationsSent == 0 }),
+              "首次与重试同轮合并，保留全部关联标识")
+    try check(ReminderSchedule.summary(six) == "事项1 · 事项2 · 事项3 · 另有 3 件" && six.count == 6,
+              "通知正文短标题溢出，完整事项集合另行关联")
 }
 
 do {

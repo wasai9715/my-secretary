@@ -33,16 +33,20 @@ final class SecretaryModel: ObservableObject {
     @Published var focusedNotificationIDs: Set<UUID>?
     var onCaptureFeedback: (@MainActor (CaptureFeedback) -> Void)?
     var onItemsChanged: (@MainActor () -> Void)?
+    var onPermissionRestored: (@MainActor () -> Void)?
     private var dispatchingIDs: Set<UUID> = []
+    private var digestInFlight = false
+    // Diagnostics replace the transport, not the scheduling/commit path.
+    var notificationOverride: ((String, String, [UUID], @escaping @MainActor (Bool) -> Void) -> Void)?
     let files: LocalFiles
     let store: ItemStore
 
-    init() throws {
-        files = try LocalFiles()
-        store = try ItemStore(path: files.databasePath)
+    init(files: LocalFiles? = nil) throws {
+        self.files = try files ?? LocalFiles()
+        store = try ItemStore(path: self.files.databasePath)
         items = try store.all()
-        configuration = try files.loadConfiguration()
-        settings = try files.loadSettings()
+        configuration = try self.files.loadConfiguration()
+        settings = try self.files.loadSettings()
     }
 
     @discardableResult
@@ -59,13 +63,14 @@ final class SecretaryModel: ObservableObject {
         }
     }
 
-    func add(_ input: String) {
-        guard configuration.verified else { message = "请先测试 DeepSeek 连接"; return }
+    @discardableResult
+    func add(_ input: String) -> Bool {
+        guard configuration.verified else { message = "请先测试 DeepSeek 连接"; return false }
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
+        guard !text.isEmpty else { return false }
         var item = ReminderItem(text: text)
         do { try store.upsert(item); items.insert(item, at: 0); onItemsChanged?() }
-        catch { message = "本机保存失败：\(error.localizedDescription)"; return }
+        catch { message = "本机保存失败：\(error.localizedDescription)"; return false }
         message = "已记下，正在安排提醒"
         // Keep the in-flight state in the menu bar; one completed result gets
         // one unobtrusive feedback card instead of replacing a second card.
@@ -79,29 +84,30 @@ final class SecretaryModel: ObservableObject {
                 switch result {
                 case .schedule(let interpretation):
                     try item.apply(interpretation)
-                    update(item)
+                    guard update(item) else { return }
                     let reminder = item.nextReminder?.formatted(date: .abbreviated, time: .shortened) ?? "待确认"
                     message = "已安排：\(reminder) 提醒"
                     onCaptureFeedback?(CaptureFeedback(item: item))
                 case .separateEntries(let reason):
                     item.fail(reason, needsSeparateEntries: true)
-                    update(item)
+                    guard update(item) else { return }
                     message = reason
                     sendNotification(title: "请分两次录入", body: "原话已保存，包含多个分别需要提醒的行动。点击查看。", ids: [item.id])
                 case .needsConfirmation(let reason):
                     item.fail(reason)
-                    update(item)
+                    guard update(item) else { return }
                     message = reason
                     sendNotification(title: "时间待确认", body: "\(item.title) — 点击查看或设置时间", ids: [item.id])
                 }
             } catch {
                 guard var current = items.first(where: { $0.id == item.id }), current.manualVersion == version, current.status == .open else { return }
                 current.fail(error.localizedDescription)
-                update(current)
+                guard update(current) else { return }
                 message = "识别失败：\(current.title)"
                 sendNotification(title: "提醒尚未安排", body: "\(current.title) — 点击设置时间或重试", ids: [current.id])
             }
         }
+        return true
     }
 
     func testAndSave(endpoint: String, model: String, token: String) async {
@@ -207,7 +213,10 @@ final class SecretaryModel: ObservableObject {
             let granted = settings.authorizationStatus == .authorized
             let undetermined = settings.authorizationStatus == .notDetermined
             Task { @MainActor in
+                let wasGranted = self.notificationGranted
                 self.notificationGranted = granted
+                self.onItemsChanged?()
+                if granted && !wasGranted { self.onPermissionRestored?() }
                 if undetermined && requestIfUndetermined { self.requestPermission() }
             }
         }
@@ -246,6 +255,10 @@ final class SecretaryModel: ObservableObject {
 
     func sendNotification(title: String, body: String, ids: [UUID], completion: (@MainActor (Bool) -> Void)? = nil) {
         guard notificationGranted else { completion?(false); return }
+        if let notificationOverride {
+            notificationOverride(title, body, ids, completion ?? { _ in })
+            return
+        }
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
@@ -264,37 +277,55 @@ final class SecretaryModel: ObservableObject {
     }
 
     func checkDue(now: Date = .now) {
-        let due = items.filter { $0.status == .open && !dispatchingIDs.contains($0.id) && $0.nextReminder.map { $0 <= now } == true && $0.notificationsSent < ($0.recognition == .needsAttention ? 1 : 3) }
+        let due = ReminderSchedule.due(items, at: now).filter { !dispatchingIDs.contains($0.id) }
         guard !due.isEmpty, notificationGranted else { return }
-        let titles = due.prefix(3).map(\.title).joined(separator: " · ")
-        let rest = due.count > 3 ? " · 另有 \(due.count - 3) 件" : ""
+        let summary = ReminderSchedule.summary(due)
         let ids = due.map(\.id)
         dispatchingIDs.formUnion(ids)
         let needsSplit = due.count == 1 && due[0].needsSeparateEntries == true
         sendNotification(title: needsSplit ? "请分两次录入" : "有 \(due.count) 件事需要处理",
-                         body: needsSplit ? "原话仍待处理，尚未安排正常提醒" : titles + rest,
+                         body: needsSplit ? "原话仍待处理，尚未安排正常提醒" : summary,
                          ids: ids) { success in
             self.dispatchingIDs.subtract(ids)
             guard success else { return }
             for old in due {
                 guard var item = self.items.first(where: { $0.id == old.id }), item.status == .open,
                       item.nextReminder == old.nextReminder, item.notificationsSent == old.notificationsSent else { continue }
-                item.notificationsSent += 1
-                if item.recognition == .needsAttention || item.notificationsSent == 3 { item.nextReminder = nil }
-                else { item.nextReminder = Date().addingTimeInterval(item.notificationsSent == 1 ? 30 * 60 : 2 * 60 * 60) }
+                item = ReminderSchedule.afterDispatch(item, at: Date())
                 self.update(item)
             }
         }
     }
 
-    func sendDigest(now: Date = .now) {
-        let pending = items.filter { item in
-            item.status == .open && (item.recognition == .needsAttention ||
-                (item.firstReminder.map { $0 <= now } == true && (item.lastUserSnooze == nil || item.lastUserSnooze! <= now)))
+    /// Returns true when the digest owns this tick, including an in-flight send.
+    /// Due reminders included in the digest count as dispatched only on success.
+    func sendDigest(now: Date = .now) -> Bool {
+        guard notificationGranted else { return false }
+        if digestInFlight { return true }
+        let pending = ReminderSchedule.digestPending(items, at: now)
+        let day = ReminderSchedule.digestDay(at: now)
+        guard !pending.isEmpty else {
+            settings.lastDigestDay = day
+            saveSettings()
+            return false
         }
-        guard !pending.isEmpty else { return }
-        let titles = pending.prefix(3).map(\.title).joined(separator: " · ")
-        sendNotification(title: "还有 \(pending.count) 件事未完成", body: titles + (pending.count > 3 ? " · 另有 \(pending.count - 3) 件" : ""), ids: pending.map(\.id))
+        digestInFlight = true
+        let due = ReminderSchedule.due(pending, at: now)
+        let ids = pending.map(\.id)
+        dispatchingIDs.formUnion(due.map(\.id))
+        sendNotification(title: "还有 \(pending.count) 件事未完成", body: ReminderSchedule.summary(pending), ids: ids) { success in
+            self.digestInFlight = false
+            self.dispatchingIDs.subtract(due.map(\.id))
+            guard success else { return }
+            self.settings.lastDigestDay = day
+            self.saveSettings()
+            for old in due {
+                guard let current = self.items.first(where: { $0.id == old.id }), current.status == .open,
+                      current.nextReminder == old.nextReminder, current.notificationsSent == old.notificationsSent else { continue }
+                self.update(ReminderSchedule.afterDispatch(current, at: Date()))
+            }
+        }
+        return true
     }
 }
 
@@ -333,6 +364,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
     private var nextHotKeyID: UInt32 = 2
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        let isDiagnostic = ProcessInfo.processInfo.arguments.contains { $0.hasPrefix("--check-") }
+        if !isDiagnostic, let bundleID = Bundle.main.bundleIdentifier,
+           let existing = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+                .first(where: { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }) {
+            existing.activate()
+            NSApp.terminate(nil)
+            return
+        }
         do { model = try SecretaryModel() }
         catch {
             NSAlert(error: error).runModal()
@@ -341,13 +380,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
         }
         NSApp.setActivationPolicy(.accessory)
         UNUserNotificationCenter.current().delegate = self
-        let isDiagnostic = ProcessInfo.processInfo.arguments.contains { $0.hasPrefix("--check-") }
         model.refreshPermission(requestIfUndetermined: !isDiagnostic)
         createStatusMenu()
         model.onCaptureFeedback = { [weak self] feedback in self?.showCaptureFeedback(feedback) }
         model.onItemsChanged = { [weak self] in self?.updateStatusMenu() }
+        model.onPermissionRestored = { [weak self] in self?.tick() }
         registerHotKey()
-        if !isDiagnostic { model.checkDue() }
+        if !isDiagnostic { tick() }
+        // Sleeping, clock corrections, and time-zone changes can invalidate the
+        // next scheduled tick; recalculate immediately on each transition.
+        for name in [NSWorkspace.didWakeNotification, NSNotification.Name.NSSystemClockDidChange,
+                     NSNotification.Name.NSSystemTimeZoneDidChange] {
+            let center: NotificationCenter = name == NSWorkspace.didWakeNotification ? NSWorkspace.shared.notificationCenter : .default
+            center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.tick() }
+            }
+        }
+        if ProcessInfo.processInfo.arguments.contains("--check-reminder-dispatch") {
+            checkReminderDispatch()
+            return
+        }
+        if ProcessInfo.processInfo.arguments.contains("--check-reminder-recovery") {
+            checkReminderRecovery()
+            return
+        }
+        if ProcessInfo.processInfo.arguments.contains("--check-reminder-digest") {
+            checkReminderDigest()
+            return
+        }
+        if ProcessInfo.processInfo.arguments.contains("--check-clock-recompute") {
+            checkClockRecompute()
+            return
+        }
+        if ProcessInfo.processInfo.arguments.contains("--check-item-lifecycle") {
+            checkItemLifecycle()
+            return
+        }
         if ProcessInfo.processInfo.arguments.contains("--check-shortcut-conflict") {
             // Reserve a candidate with Carbon itself, then make sure the
             // rejected change never reaches the user's saved settings.
@@ -435,8 +503,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
                     guard let window = self.panel else { exit(48) }
                     guard window.isKeyWindow, window.firstResponder is NSTextView else {
-                        fputs("录入框未取得焦点：key=\(window.isKeyWindow) responder=\(String(describing: window.firstResponder))\n", stderr)
+                        fputs("录入框未取得焦点：key=\(window.isKeyWindow) active=\(NSApp.isActive) frontmost=\(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "unknown") responder=\(String(describing: window.firstResponder))\n", stderr)
                         exit(47)
+                    }
+                    guard self.statusItem.button != nil,
+                          let screen = NSScreen.main ?? NSScreen.screens.first,
+                          screen.visibleFrame.contains(window.frame) else {
+                        fputs("菜单栏入口不可用或录入浮层不在当前屏幕可视范围\n", stderr)
+                        exit(88)
                     }
                     self.sendDiagnosticEscape(to: window)
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
@@ -538,6 +612,187 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
         }
     }
 
+    private func checkReminderDispatch() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SecretaryDispatch-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        do {
+            model = try SecretaryModel(files: LocalFiles(directory: directory))
+            model.notificationGranted = true
+            let now = Date()
+            let dueAt = now.addingTimeInterval(-120)
+            var entries: [ReminderItem] = []
+            for number in 1...6 {
+                var item = ReminderItem(text: "虚构测试项 \(number)", now: now.addingTimeInterval(-3600))
+                try item.apply(.init(title: "事项\(number)", reminder: dueAt,
+                                     deadline: nil, suggestedCompletion: nil), now: now.addingTimeInterval(-3600))
+                if number == 1 { item.notificationsSent = 1 }
+                guard model.update(item) else { exit(70) }
+                entries.append(item)
+            }
+            var sent = 0
+            var shouldSucceed = false
+            model.notificationOverride = { title, body, ids, completion in
+                sent += 1
+                guard title.contains("6 件"), body.contains("另有 3 件"),
+                      Set(ids) == Set(entries.map(\.id)) else { exit(71) }
+                completion(shouldSucceed)
+            }
+            model.checkDue(now: now)
+            guard sent == 1 else { exit(72) }
+            guard model.items.allSatisfy({ current in
+                entries.first(where: { $0.id == current.id })?.notificationsSent == current.notificationsSent &&
+                entries.first(where: { $0.id == current.id })?.nextReminder == current.nextReminder
+            }) else { exit(73) }
+            shouldSucceed = true
+            model.checkDue(now: now)
+            guard sent == 2, model.items.allSatisfy({ current in
+                guard let prior = entries.first(where: { $0.id == current.id }) else { return false }
+                return current.notificationsSent == prior.notificationsSent + 1 && current.nextReminder != nil
+            }) else { exit(74) }
+            model.checkDue(now: now)
+            guard sent == 2 else { exit(75) }
+            let first = model.items.first(where: { $0.id == entries[0].id })!
+            guard first.nextReminder!.timeIntervalSinceNow > 7000 else { exit(76) }
+            print("派发失败不推进、成功仅推进一次；混合首次/重试合并及六项关联：通过")
+            NSApp.terminate(nil)
+        } catch { fputs("提醒派发检查失败：\(error)\n", stderr); exit(77) }
+    }
+
+    private func checkReminderRecovery() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SecretaryRecovery-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        do {
+            model = try SecretaryModel(files: LocalFiles(directory: directory))
+            model.notificationGranted = true
+            let now = Date()
+            let overdue = now.addingTimeInterval(-2 * 24 * 3600)
+            var items: [ReminderItem] = []
+            for number in 1...2 {
+                var item = ReminderItem(text: "过期项 \(number)", now: overdue.addingTimeInterval(-3600))
+                try item.apply(.init(title: "过期项 \(number)", reminder: overdue,
+                                     deadline: nil, suggestedCompletion: nil), now: overdue.addingTimeInterval(-3600))
+                guard model.update(item) else { exit(78) }
+                items.append(item)
+            }
+            var notifications = 0
+            model.notificationOverride = { _, _, ids, completion in
+                notifications += 1
+                guard Set(ids) == Set(items.map(\.id)) else { exit(79) }
+                completion(true)
+            }
+            // Reopen a persisted ledger after two days; don't replay elapsed retries.
+            model = try SecretaryModel(files: LocalFiles(directory: directory))
+            model.notificationGranted = true
+            model.notificationOverride = { _, _, ids, completion in
+                notifications += 1
+                guard Set(ids) == Set(items.map(\.id)) else { exit(79) }
+                completion(true)
+            }
+            model.checkDue(now: now)
+            guard notifications == 1,
+                  model.items.allSatisfy({ $0.notificationsSent == 1 && $0.nextReminder != nil }),
+                  ReminderSchedule.due(model.items, at: now).isEmpty else { exit(80) }
+            model.checkDue(now: now)
+            guard notifications == 1 else { exit(81) }
+            print("退出两天重开只合并补发一次，未虚算遗漏轮次：通过")
+            NSApp.terminate(nil)
+        } catch { fputs("重开补发检查失败：\(error)\n", stderr); exit(82) }
+    }
+
+    private func checkReminderDigest() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SecretaryDigest-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        do {
+            model = try SecretaryModel(files: LocalFiles(directory: directory))
+            model.notificationGranted = true
+            let now = Date()
+            var expired = ReminderItem(text: "汇总过期事项", now: now.addingTimeInterval(-3600))
+            try expired.apply(.init(title: "过期", reminder: now.addingTimeInterval(-120), deadline: nil,
+                                    suggestedCompletion: nil), now: now.addingTimeInterval(-3600))
+            var pending = ReminderItem(text: "汇总待识别事项", now: now.addingTimeInterval(-3600))
+            pending.fail("虚构识别故障", now: now.addingTimeInterval(-1800))
+            var snoozed = expired
+            snoozed.id = UUID()
+            try snoozed.snooze(until: now.addingTimeInterval(3600), now: now)
+            for item in [expired, pending, snoozed] { guard model.update(item) else { exit(83) } }
+            var sent = 0
+            var succeeds = false
+            model.notificationOverride = { _, _, ids, completion in
+                sent += 1
+                guard Set(ids) == Set([expired.id, pending.id]) else { exit(84) }
+                completion(succeeds)
+            }
+            guard model.sendDigest(now: now), sent == 1, model.settings.lastDigestDay.isEmpty,
+                  model.items.first(where: { $0.id == expired.id })?.notificationsSent == 0 else { exit(85) }
+            succeeds = true
+            guard model.sendDigest(now: now), sent == 2,
+                  model.settings.lastDigestDay == ReminderSchedule.digestDay(at: now),
+                  model.items.first(where: { $0.id == expired.id })?.notificationsSent == 1,
+                  model.items.first(where: { $0.id == pending.id })?.notificationsSent == 1,
+                  model.items.first(where: { $0.id == snoozed.id })?.notificationsSent == 0,
+                  !ReminderSchedule.shouldSendDigest(at: now, settings: model.settings) else { exit(86) }
+            print("汇总失败可重试；成功记录当天并推进同轮到期事项，排除未来推迟：通过")
+            NSApp.terminate(nil)
+        } catch { fputs("每日汇总检查失败：\(error)\n", stderr); exit(87) }
+    }
+
+    private func checkClockRecompute() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SecretaryClock-\(UUID().uuidString)")
+        do {
+            model = try SecretaryModel(files: LocalFiles(directory: directory))
+            model.notificationGranted = true
+            model.settings.lastDigestDay = ReminderSchedule.digestDay(at: .now)
+            let now = Date()
+            var item = ReminderItem(text: "系统时钟变化测试", now: now.addingTimeInterval(-3600))
+            try item.apply(.init(title: "时钟测试", reminder: now.addingTimeInterval(-60),
+                                 deadline: nil, suggestedCompletion: nil), now: now.addingTimeInterval(-3600))
+            guard model.update(item) else { exit(89) }
+            var sent = 0
+            model.notificationOverride = { _, _, _, completion in sent += 1; completion(true) }
+            NotificationCenter.default.post(name: .NSSystemClockDidChange, object: nil)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                guard let self, sent == 1,
+                      self.model.items.first?.notificationsSent == 1 else { exit(90) }
+                NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.didWakeNotification, object: nil)
+                NotificationCenter.default.post(name: .NSSystemTimeZoneDidChange, object: nil)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    guard sent == 1 else { exit(91) }
+                    try? FileManager.default.removeItem(at: directory)
+                    print("时钟变化立即重算；唤醒与时区变化不重放已派发轮次：通过")
+                    NSApp.terminate(nil)
+                }
+            }
+        } catch { fputs("时钟重算检查失败：\(error)\n", stderr); exit(92) }
+    }
+
+    private func checkItemLifecycle() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SecretaryLifecycle-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        do {
+            model = try SecretaryModel(files: LocalFiles(directory: directory))
+            let now = Date()
+            var original = ReminderItem(text: "历史恢复测试", now: now.addingTimeInterval(-7200))
+            let passedDeadline = now.addingTimeInterval(-60)
+            try original.apply(.init(title: "过期但未完成", reminder: now.addingTimeInterval(-3600),
+                                     deadline: passedDeadline, suggestedCompletion: nil), now: now.addingTimeInterval(-7200))
+            guard model.update(original), model.items.first?.status == .open else { exit(93) }
+            guard model.changeStatus(original, to: .completed), model.items.first?.nextReminder == nil,
+                  model.undoStatus(original), model.items.first?.status == .open,
+                  model.items.first?.nextReminder == original.nextReminder else { exit(94) }
+            guard model.changeStatus(original, to: .cancelled) else { exit(95) }
+            let newTime = now.addingTimeInterval(3600)
+            guard model.restore(original, until: newTime), model.items.first?.status == .open,
+                  model.items.first?.nextReminder == newTime,
+                  model.items.first?.notificationsSent == 0 else { exit(96) }
+            let reopened = try SecretaryModel(files: LocalFiles(directory: directory))
+            guard reopened.items.first?.nextReminder == newTime,
+                  reopened.items.first?.deadline == passedDeadline,
+                  reopened.items.first?.status == .open else { exit(97) }
+            print("过期仍未完成；完成/取消、立即撤销与历史选新时间恢复持久化：通过")
+            NSApp.terminate(nil)
+        } catch { fputs("事项生命周期检查失败：\(error)\n", stderr); exit(98) }
+    }
+
     private func sendDiagnosticEscape(to window: NSWindow) {
         guard let key = NSEvent.keyEvent(with: .keyDown, location: .zero,
                                         modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
@@ -549,14 +804,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
 
     private func tick() {
         model.refreshPermission()
-        model.checkDue()
         let now = Date()
-        let calendar = Calendar.current
-        let day = calendar.startOfDay(for: now).formatted(.iso8601)
-        if (calendar.component(.hour, from: now), calendar.component(.minute, from: now)) >= (model.settings.digestHour, model.settings.digestMinute), day != model.settings.lastDigestDay, model.notificationGranted {
-            model.sendDigest(now: now)
-            model.settings.lastDigestDay = day
-            model.saveSettings()
+        if !ReminderSchedule.shouldSendDigest(at: now, settings: model.settings) || !model.sendDigest(now: now) {
+            model.checkDue(now: now)
         }
         updateStatusMenu()
     }
@@ -568,6 +818,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
         statusItem.button?.image = NSImage(systemSymbolName: unhealthy ? "bell.slash.fill" : (processing ? "clock.arrow.circlepath" : "checklist"),
                                           accessibilityDescription: unhealthy ? "My Secretary：提醒不可用或有待处理错误" : (processing ? "My Secretary：已记下，正在安排提醒" : "My Secretary"))
         permissionItem?.isHidden = model.notificationGranted
+        let pendingCount = model.items.filter { $0.status == .open }.count
+        permissionItem?.title = "⚠️ 通知未开启 · \(pendingCount) 件待处理，打开系统设置"
         processingItem?.isHidden = !processing
     }
 

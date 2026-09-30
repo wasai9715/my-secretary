@@ -1,8 +1,8 @@
 import Foundation
 import SecretaryCore
 
-// Synthetic sentences only. Run explicitly; consumes three DeepSeek requests
-// (plus at most one corrective call per invalid model output).
+// Synthetic sentences only. Run explicitly; performs a valid and an invalid
+// connection test plus five interpretations (and possible corrective calls).
 @main
 struct SecretaryAISmoke {
     static func main() async {
@@ -11,6 +11,19 @@ struct SecretaryAISmoke {
             let config = try files.loadConfiguration()
             guard config.verified else { throw RecognitionError.invalid("请先测试模型连接") }
             let client = DeepSeekClient(configuration: config)
+            try await client.testConnection()
+            print("✓ 已保存凭据连接测试通过")
+            var invalid = config
+            invalid.token = "invalid-secretary-smoke-token"
+            do {
+                try await DeepSeekClient(configuration: invalid).testConnection()
+                throw RecognitionError.invalid("无效凭据意外通过连接测试")
+            } catch RecognitionError.connection(let reason) where reason.contains("HTTP 401") {
+                print("✓ 无效凭据被服务端拒绝")
+            }
+            guard try files.loadConfiguration().token == config.token else {
+                throw RecognitionError.invalid("负向测试修改了已保存凭据")
+            }
             let samples = [
                 ("明天提醒我写周报", "single"),
                 ("后天给阿姨买东西", "single"),

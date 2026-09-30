@@ -9,9 +9,17 @@ public final class ItemStore {
     public init(path: String) throws {
         let directory = (path as NSString).deletingLastPathComponent
         try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
-        guard sqlite3_open(path, &db) == SQLITE_OK else { throw storageError() }
+        guard sqlite3_open(path, &db) == SQLITE_OK else {
+            let error = storageError()
+            sqlite3_close(db)
+            db = nil
+            throw error
+        }
         guard sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS items (id TEXT PRIMARY KEY, payload BLOB NOT NULL)", nil, nil, nil) == SQLITE_OK else {
-            throw storageError()
+            let error = storageError()
+            sqlite3_close(db)
+            db = nil
+            throw error
         }
     }
 
@@ -30,13 +38,27 @@ public final class ItemStore {
 
     public func all() throws -> [ReminderItem] {
         var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT payload FROM items", -1, &statement, nil) == SQLITE_OK else { throw storageError() }
+        guard sqlite3_prepare_v2(db, "SELECT id, payload FROM items", -1, &statement, nil) == SQLITE_OK else { throw storageError() }
         defer { sqlite3_finalize(statement) }
         var result: [ReminderItem] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
-            guard let bytes = sqlite3_column_blob(statement, 0) else { continue }
-            let size = Int(sqlite3_column_bytes(statement, 0))
-            result.append(try JSONDecoder().decode(ReminderItem.self, from: Data(bytes: bytes, count: size)))
+        while true {
+            let step = sqlite3_step(statement)
+            if step == SQLITE_DONE { break }
+            guard step == SQLITE_ROW else { throw storageError() }
+            guard let idBytes = sqlite3_column_text(statement, 0),
+                  let bytes = sqlite3_column_blob(statement, 1) else {
+                throw RecognitionError.connection("本机事项数据损坏：无法读取记录")
+            }
+            let id = String(cString: idBytes)
+            let size = Int(sqlite3_column_bytes(statement, 1))
+            do {
+                let item = try JSONDecoder().decode(ReminderItem.self, from: Data(bytes: bytes, count: size))
+                guard item.id.uuidString == id else {
+                    throw RecognitionError.connection("本机事项数据损坏：记录标识不一致（\(id)）")
+                }
+                result.append(item)
+            } catch let error as RecognitionError { throw error }
+            catch { throw RecognitionError.connection("本机事项数据损坏：无法解码记录（\(id)），请保留数据库以便恢复") }
         }
         return result.sorted { $0.createdAt > $1.createdAt }
     }

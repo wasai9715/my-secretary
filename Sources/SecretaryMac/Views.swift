@@ -18,8 +18,7 @@ struct CaptureView: View {
                 Text("ESC 关闭").font(.caption).foregroundStyle(.secondary)
             }
             FocusedCaptureField(text: $text, submit: {
-                model.add(text)
-                dismiss()
+                if model.add(text) { dismiss() }
             }, cancel: dismiss)
                 .frame(height: 28)
                 .overlay(RoundedRectangle(cornerRadius: 7)

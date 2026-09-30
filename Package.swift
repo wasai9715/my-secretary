@@ -12,7 +12,7 @@ let package = Package(
         .systemLibrary(name: "CSQLite3"),
         .target(name: "SecretaryCore", dependencies: ["CSQLite3"], resources: [.process("Resources")]),
         .executableTarget(name: "SecretaryMac", dependencies: ["SecretaryCore"], resources: [.process("Resources")]),
-        .executableTarget(name: "SecretaryCoreChecks", dependencies: ["SecretaryCore"], path: "Tests/SecretaryCoreChecks"),
+        .executableTarget(name: "SecretaryCoreChecks", dependencies: ["SecretaryCore", "CSQLite3"], path: "Tests/SecretaryCoreChecks"),
         .executableTarget(name: "SecretaryAISmoke", dependencies: ["SecretaryCore"], path: "Tests/SecretaryAISmoke"),
     ]
 )

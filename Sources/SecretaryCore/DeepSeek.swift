@@ -15,7 +15,12 @@ public struct DeepSeekClient: Sendable {
     public init(configuration: AIConfiguration) { self.configuration = configuration }
 
     public func testConnection() async throws {
-        _ = try await chat(system: "请仅返回 JSON 对象。", user: "返回 {\"ok\":true}。")
+        let response = try await chat(system: "请仅返回 JSON 对象。", user: "返回 {\"ok\":true}。")
+        guard let data = response.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let ok = object["ok"] as? Bool, ok else {
+            throw RecognitionError.invalid("模型连接测试未返回预期结果")
+        }
     }
 
     public static func timeContext(now: Date, timeZone: TimeZone = .current) -> String {
