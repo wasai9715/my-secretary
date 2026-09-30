@@ -481,6 +481,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
                 DispatchQueue.main.asyncAfter(deadline: .now() + 5) { NSApp.terminate(nil) }
             }
         }
+        if ProcessInfo.processInfo.arguments.contains("--check-management-escape") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                self?.showManagement()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                    guard let self, let window = self.management, let webView = self.managementWeb?.webView,
+                          window.isVisible else { exit(62) }
+                    webView.evaluateJavaScript("document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}))") { _, error in
+                        guard error == nil else { exit(63) }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                            guard !window.isVisible else {
+                                fputs("管理页面按 Escape 后仍然打开\n", stderr)
+                                exit(64)
+                            }
+                            NSApp.terminate(nil)
+                        }
+                    }
+                }
+            }
+        }
+        if ProcessInfo.processInfo.arguments.contains("--check-management-drag") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                self?.showManagement()
+                guard let window = self?.management, let content = window.contentView else { exit(60) }
+                guard window.styleMask.contains(.titled),
+                      !window.styleMask.contains(.fullSizeContentView),
+                      window.frame.height > content.frame.height else {
+                    fputs("管理窗口没有独立的原生可拖动标题栏\n", stderr)
+                    exit(61)
+                }
+                NSApp.terminate(nil)
+            }
+        }
         if ProcessInfo.processInfo.arguments.contains("--check-management-window") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
                 self?.showManagement()
@@ -647,17 +679,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
     private func presentManagement() {
         if management == nil {
             management = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1050, height: 650),
-                                  styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
+                                  styleMask: [.titled, .closable, .resizable],
                                   backing: .buffered, defer: false)
             management?.isReleasedWhenClosed = false
             management?.title = "My Secretary · 事项"
-            management?.titleVisibility = .hidden
-            management?.titlebarAppearsTransparent = true
             management?.backgroundColor = NSColor(calibratedRed: 0.973, green: 0.980, blue: 0.984, alpha: 1)
             management?.center()
         }
         if managementWeb == nil {
-            let host = ManagementWebHost(model: model, capture: { [weak self] in self?.showCapture() })
+            let host = ManagementWebHost(model: model, capture: { [weak self] in self?.showCapture() },
+                                         close: { [weak self] in self?.management?.performClose(nil) })
             managementWeb = host
             management?.contentView = host.webView
         }

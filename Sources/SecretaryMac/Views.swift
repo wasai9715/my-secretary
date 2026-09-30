@@ -172,6 +172,7 @@ final class ManagementWebHost: NSObject, WKScriptMessageHandler, WKNavigationDel
     let webView: WKWebView
     private let model: SecretaryModel
     private let capture: () -> Void
+    private let close: () -> Void
     private var observation: AnyCancellable?
     private let handler = WeakManagementHandler()
     private var loaded = false
@@ -179,9 +180,10 @@ final class ManagementWebHost: NSObject, WKScriptMessageHandler, WKNavigationDel
     private var undoItem: ReminderItem?
     private var undoExpires: Date?
 
-    init(model: SecretaryModel, capture: @escaping () -> Void) {
+    init(model: SecretaryModel, capture: @escaping () -> Void, close: @escaping () -> Void) {
         self.model = model
         self.capture = capture
+        self.close = close
         let config = WKWebViewConfiguration()
         config.defaultWebpagePreferences.allowsContentJavaScript = true
         webView = WKWebView(frame: .zero, configuration: config)
@@ -300,6 +302,7 @@ final class ManagementWebHost: NSObject, WKScriptMessageHandler, WKNavigationDel
         guard message.frameInfo.isMainFrame, message.name == "management",
               let body = message.body as? [String: Any], let action = body["action"] as? String else { return }
         if action == "ready" { loaded = true; publish(); return }
+        if action == "close" { close(); return }
         if action == "add" { capture(); return }
         if action == "all" { model.focusedNotificationIDs = nil; resetRoute(); return }
         if action == "permission" { SecretaryModel.openSystemNotificationSettings(); return }
