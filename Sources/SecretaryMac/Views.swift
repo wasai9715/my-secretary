@@ -1,4 +1,5 @@
 import SwiftUI
+import ServiceManagement
 import AppKit
 import SecretaryCore
 import WebKit
@@ -93,6 +94,7 @@ private struct FocusedCaptureField: NSViewRepresentable {
 struct CaptureFeedbackView: View {
     let feedback: CaptureFeedback
     let openItem: () -> Void
+    let undo: () -> Void
 
     private var timeLabel: String {
         guard let date = feedback.reminder else { return "提醒时间待确认" }
@@ -139,6 +141,9 @@ struct CaptureFeedbackView: View {
             .lineLimit(1)
             .help("点击查看或修改完整安排")
             HStack {
+                Button("撤销录入", action: undo)
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
                 Spacer()
                 Button(action: openItem) {
                     HStack(spacing: 3) {
@@ -205,6 +210,8 @@ final class ManagementWebHost: NSObject, WKScriptMessageHandler, WKNavigationDel
         }
     }
 
+    func refresh() { publish() }
+
     func resetRoute() {
         pendingReset = true
         publish()
@@ -258,8 +265,13 @@ final class ManagementWebHost: NSObject, WKScriptMessageHandler, WKNavigationDel
         guard loaded else { return }
         let snapshot: [[String: Any]] = model.items.map { item in
             ["id": item.id.uuidString, "title": item.title, "original": item.originalText,
+             "initialCapture": item.initialCaptureText as Any? ?? NSNull(),
              "text": item.text, "status": item.status.rawValue, "recognition": item.recognition.rawValue,
+             "timeUnchangedAfterContentEdit": item.timeUnchangedAfterContentEdit == true,
              "reminder": local(item.nextReminder) as Any? ?? NSNull(),
+             "firstReminder": local(item.firstReminder) as Any? ?? NSNull(),
+             "reminderSource": item.reminderSource as Any? ?? NSNull(),
+             "timeEvidence": item.timeEvidence ?? [],
              "deadline": local(item.deadline) as Any? ?? NSNull(),
              "deadlineDay": item.deadlineDay as Any? ?? NSNull(),
              "period": item.deadlinePeriod as Any? ?? NSNull(),
@@ -267,6 +279,8 @@ final class ManagementWebHost: NSObject, WKScriptMessageHandler, WKNavigationDel
              "suggestion": local(item.suggestedCompletion) as Any? ?? NSNull(),
              "failure": item.failure.map(safeMessage) as Any? ?? NSNull(),
              "split": item.needsSeparateEntries == true,
+             "retryable": item.status == .open && item.recognition == .needsAttention &&
+                 item.needsSeparateEntries != true && item.manualVersion == 0 && item.text == item.originalText,
              "attention": item.recognition == .needsAttention,
              "created": item.createdAt.timeIntervalSince1970 * 1000]
         }
@@ -275,10 +289,51 @@ final class ManagementWebHost: NSObject, WKScriptMessageHandler, WKNavigationDel
             "focus": model.focusedNotificationIDs.map { $0.map(\.uuidString) } as Any? ?? NSNull(),
             "permission": model.notificationGranted,
             "message": model.message.isEmpty ? "" : safeMessage(model.message),
-            "presets": model.settings.presetsMinutes,
+            "presets": model.settings.resolvedPresets.map { preset -> [String: Any] in
+                ["rule": preset.rule.rawValue, "minutes": preset.minutes as Any? ?? NSNull(),
+                 "dayOffset": preset.dayOffset as Any? ?? NSNull(),
+                 "hour": preset.hour as Any? ?? NSNull(), "minute": preset.minute as Any? ?? NSNull(),
+                 "label": preset.label]
+            },
             "reset": pendingReset]
         pendingReset = false
         evaluate("managementState", state)
+    }
+
+    private static func beyondDeadline(_ reminder: Date, deadline: Date?, day: String?) -> Bool {
+        if let deadline { return reminder > deadline }
+        if let day, let end = ReminderItem.endOfLocalDay(day) { return reminder >= end }
+        return false
+    }
+
+    private func commandResult(_ outcome: SecretaryModel.CommandOutcome) {
+        switch outcome {
+        case .applied: result("command")
+        case .preview(let date):
+            publish()
+            evaluate("managementCommandResult", ["kind": "preview", "reminder": local(date) ?? ""])
+        case .previewEdit(let edit):
+            let deadline: String?
+            let precision: String
+            switch edit.deadline {
+            case .instant(let at): deadline = local(at); precision = "instant"
+            case .day(let day): deadline = day; precision = "day"
+            case nil: deadline = nil; precision = "none"
+            }
+            publish()
+            evaluate("managementCommandResult", ["kind": "previewEdit",
+                "reminder": local(edit.reminder) as Any? ?? NSNull(),
+                "deadline": deadline as Any? ?? NSNull(), "deadlineKind": precision])
+        case .choosePreset:
+            publish()
+            evaluate("managementCommandResult", ["kind": "choosePreset"])
+        case .needsDeadlineConfirmation:
+            publish()
+            evaluate("managementCommandResult", ["kind": "confirmDeadline"])
+        case .rejected(let error):
+            publish()
+            evaluate("managementCommandResult", ["kind": "error", "message": safeMessage(error)])
+        }
     }
 
     private func result(_ action: String, error: String? = nil, undo: ReminderItem? = nil) {
@@ -309,8 +364,58 @@ final class ManagementWebHost: NSObject, WKScriptMessageHandler, WKNavigationDel
         if action == "add" { capture(); return }
         if action == "all" { model.focusedNotificationIDs = nil; resetRoute(); return }
         if action == "permission" { SecretaryModel.openSystemNotificationSettings(); return }
+        if action == "clearHistory" {
+            let alert = NSAlert()
+            alert.messageText = "永久清空历史事项？"
+            alert.informativeText = "已完成和已取消的本地事项将被删除，无法撤销。未完成事项不会受影响。"
+            alert.addButton(withTitle: "清空历史")
+            alert.addButton(withTitle: "保留")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            let success = model.clearHistory()
+            result(action, error: success ? nil : safeMessage(model.message))
+            return
+        }
         guard let rawID = body["id"] as? String, let id = UUID(uuidString: rawID),
               let item = model.items.first(where: { $0.id == id }) else { return }
+        if action == "previewEditCommand" {
+            guard let instruction = body["instruction"] as? String,
+                  !instruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                commandResult(.rejected("请输入要修改的内容或时间")); return
+            }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.commandResult(await self.model.previewEditCommand(id, instruction: instruction))
+            }
+            return
+        }
+        if action == "confirmEditPreview" {
+            commandResult(model.confirmEditPreview(id))
+            return
+        }
+        if action == "previewReminderCommand" {
+            guard let instruction = body["instruction"] as? String,
+                  !instruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                commandResult(.rejected("请输入明确的提醒时间")); return
+            }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.commandResult(await self.model.previewReminderCommand(id, instruction: instruction))
+            }
+            return
+        }
+        if action == "confirmReminderPreview" {
+            commandResult(model.confirmReminderPreview(id))
+            return
+        }
+        if action == "confirmDeadlineCommand" {
+            commandResult(model.confirmDeadlineCommand(id))
+            return
+        }
+        if action == "retry" {
+            let success = model.retryRecognition(id)
+            result(action, error: success ? nil : safeMessage(model.message))
+            return
+        }
         if action == "copy" {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(item.originalText, forType: .string)
@@ -333,10 +438,21 @@ final class ManagementWebHost: NSObject, WKScriptMessageHandler, WKNavigationDel
             return
         }
         if action == "snooze" || action == "restore" {
-            guard let value = body["reminder"] as? String, let when = parse(value), when > .now else {
+            let when: Date?
+            if let index = body["presetIndex"] as? Int {
+                let rules = model.settings.resolvedPresets
+                when = rules.indices.contains(index) ? try? rules[index].resolve() : nil
+            } else {
+                when = parse(body["reminder"] as? String)
+            }
+            guard let when, when > .now else {
                 result(action, error: "请选择将来的有效提醒时间"); return
             }
-            let success = action == "restore" ? model.restore(item, until: when) : model.snooze(item, until: when, overrideDeadline: true)
+            let override = body["overrideDeadline"] as? Bool == true
+            guard override || !Self.beyondDeadline(when, deadline: item.deadline, day: item.deadlineDay) else {
+                result(action, error: "提醒晚于明确截止，请明确确认后再设置"); return
+            }
+            let success = action == "restore" ? model.restore(item, until: when, overrideDeadline: override) : model.snooze(item, until: when, overrideDeadline: override)
             result(action, error: success ? nil : safeMessage(model.message))
             return
         }
@@ -357,12 +473,18 @@ final class ManagementWebHost: NSObject, WKScriptMessageHandler, WKNavigationDel
             guard reminder == nil || unchangedReminder || reminder! > .now else {
                 result(action, error: "请选择将来的提醒时间"); return
             }
+            let selectedReminder = unchangedReminder ? item.nextReminder : reminder
+            guard body["overrideDeadline"] as? Bool == true || selectedReminder == nil ||
+                    !Self.beyondDeadline(selectedReminder!, deadline: deadline, day: day?.isEmpty == false ? day : nil) else {
+                result(action, error: "提醒晚于明确截止，请明确确认后再保存"); return
+            }
             let success = model.editDetails(item, title: title, text: text,
-                reminder: unchangedReminder ? item.nextReminder : reminder,
+                reminder: selectedReminder,
                 deadline: deadline, deadlineDay: day?.isEmpty == false ? day : nil,
                 clearPeriod: body["clearPeriod"] as? Bool ?? false,
                 resolvesSingleAction: body["single"] as? Bool ?? false,
-                restoreSplit: item.status != .open && item.needsSeparateEntries == true)
+                restoreSplit: item.status != .open && item.needsSeparateEntries == true,
+                overrideDeadline: body["overrideDeadline"] as? Bool == true)
             result(action, error: success ? nil : safeMessage(model.message))
         }
     }
@@ -380,8 +502,10 @@ struct SettingsView: View {
     @State private var token = ""
     @State private var showAdvanced = false
     @State private var testing = false
-    @State private var presetsInput = ""
+    @State private var presetDraft: [ReminderPreset] = []
     @State private var presetError = ""
+    @State private var launchAtLogin = false
+    @State private var loginError = ""
 
     var body: some View {
         ScrollView {
@@ -453,29 +577,89 @@ struct SettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                settingsSection("登录启动", subtitle: "登录 Mac 后自动恢复提醒助手") {
+                    Toggle("登录时启动 MySecretary", isOn: Binding(
+                        get: { launchAtLogin },
+                        set: { enabled in
+                            do {
+                                if enabled { try SMAppService.mainApp.register() }
+                                else { try SMAppService.mainApp.unregister() }
+                                launchAtLogin = SMAppService.mainApp.status == .enabled
+                                loginError = ""
+                            } catch {
+                                launchAtLogin = SMAppService.mainApp.status == .enabled
+                                loginError = "设置登录启动失败：\(error.localizedDescription)"
+                            }
+                        }))
+                    if !loginError.isEmpty { Text(loginError).font(.caption).foregroundStyle(.red) }
+                }
                 settingsSection("提醒", subtitle: "设置推迟提醒和每日汇总的时间") {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("推迟预设").font(.subheadline.weight(.medium))
-                        HStack(spacing: 10) {
-                            TextField("例如 15, 30, 60", text: $presetsInput)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(maxWidth: 220)
-                            Text("分钟，逗号分隔")
-                                .font(.caption).foregroundStyle(.secondary)
-                            Spacer(minLength: 0)
+                        Text("点击时从当前时间起算；已有提醒不会因修改预设而改变。")
+                            .font(.caption).foregroundStyle(.secondary)
+                        ForEach(presetDraft.indices, id: \.self) { index in
+                            HStack(spacing: 8) {
+                                Picker("类型", selection: Binding(
+                                    get: { presetDraft[index].rule },
+                                    set: { presetDraft[index] = $0 == .duration
+                                        ? ReminderPreset(minutes: 15)
+                                        : ReminderPreset(dayOffset: 1, hour: 9, minute: 0) })) {
+                                    Text("时长").tag(ReminderPreset.Rule.duration)
+                                    Text("指定日时").tag(ReminderPreset.Rule.relativeDayTime)
+                                }.frame(width: 115)
+                                if presetDraft[index].rule == .duration {
+                                    Stepper("\(presetDraft[index].minutes ?? 15) 分钟后", value: Binding(
+                                        get: { presetDraft[index].minutes ?? 15 },
+                                        set: { presetDraft[index] = ReminderPreset(minutes: $0) }), in: 1...43200)
+                                } else {
+                                    Picker("日期", selection: Binding(
+                                        get: { presetDraft[index].dayOffset ?? 1 },
+                                        set: { presetDraft[index] = ReminderPreset(dayOffset: $0,
+                                            hour: presetDraft[index].hour ?? 9, minute: presetDraft[index].minute ?? 0) })) {
+                                        ForEach(1...30, id: \.self) { day in Text(day == 1 ? "明天" : "\(day) 天后").tag(day) }
+                                    }.frame(width: 105)
+                                    Picker("时", selection: Binding(
+                                        get: { presetDraft[index].hour ?? 9 },
+                                        set: { presetDraft[index] = ReminderPreset(dayOffset: presetDraft[index].dayOffset ?? 1,
+                                            hour: $0, minute: presetDraft[index].minute ?? 0) })) {
+                                        ForEach(0..<24, id: \.self) { Text(String(format: "%02d", $0)).tag($0) }
+                                    }.frame(width: 65)
+                                    Picker("分", selection: Binding(
+                                        get: { presetDraft[index].minute ?? 0 },
+                                        set: { presetDraft[index] = ReminderPreset(dayOffset: presetDraft[index].dayOffset ?? 1,
+                                            hour: presetDraft[index].hour ?? 9, minute: $0) })) {
+                                        ForEach(0..<60, id: \.self) { Text(String(format: "%02d", $0)).tag($0) }
+                                    }.frame(width: 65)
+                                }
+                                Button("移除") { presetDraft.remove(at: index) }
+                            }
+                        }
+                        HStack {
+                            Button("添加时长") { presetDraft.append(ReminderPreset(minutes: 15)) }
+                                .disabled(presetDraft.count >= 5)
+                            Button("添加明天定时") { presetDraft.append(ReminderPreset(dayOffset: 1, hour: 9, minute: 0)) }
+                                .disabled(presetDraft.count >= 5)
                             Button("保存预设") {
-                                let values = presetsInput.split(separator: ",", omittingEmptySubsequences: false)
-                                    .map { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
-                                guard (1...5).contains(values.count),
-                                      values.allSatisfy({ $0.map { (1...1440).contains($0) } == true }) else {
-                                    presetError = "请输入 1–5 个 1 到 1440 的分钟数，逗号分隔"
+                                guard (1...5).contains(presetDraft.count),
+                                      presetDraft.allSatisfy({ rule in
+                                          switch rule.rule {
+                                          case .duration: return rule.minutes.map { (1...43200).contains($0) } == true
+                                          case .relativeDayTime:
+                                              return rule.dayOffset.map { (1...30).contains($0) } == true &&
+                                                  rule.hour.map { (0...23).contains($0) } == true &&
+                                                  rule.minute.map { (0...59).contains($0) } == true
+                                          }
+                                      }) else {
+                                    presetError = "请设置 1–5 个有效预设"
                                     return
                                 }
-                                model.settings.presetsMinutes = values.compactMap { $0 }
+                                model.settings.presetRules = presetDraft
                                 model.saveSettings()
                                 presetError = ""
                             }
                         }
+                        Text("最多 5 个预设").font(.caption).foregroundStyle(.secondary)
                         if !presetError.isEmpty { Text(presetError).font(.caption).foregroundStyle(.red) }
                     }
                     Divider()
@@ -525,7 +709,8 @@ struct SettingsView: View {
             endpoint = model.configuration.endpoint
             name = model.configuration.model
             token = model.configuration.token
-            presetsInput = model.settings.presetsMinutes.map(String.init).joined(separator: ", ")
+            presetDraft = model.settings.resolvedPresets
+            launchAtLogin = SMAppService.mainApp.status == .enabled
         }
         .frame(minWidth: 580, minHeight: 490)
     }

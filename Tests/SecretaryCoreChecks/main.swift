@@ -7,7 +7,7 @@ func check(_ value: @autoclosure () throws -> Bool, _ label: String) throws {
     print("✓ \(label)")
 }
 
-func run() throws {
+func run() async throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: directory) }
     let files = try LocalFiles(directory: directory)
@@ -248,6 +248,71 @@ func run() throws {
         try check(captured.firstReminder == now.addingTimeInterval(900), "确实无时间线索才使用15分钟默认值")
     default: throw RecognitionError.invalid("无时间事项未进入默认提醒")
     }
+    // Exercise the actual interpretation pipeline with deterministic model responses.
+    // No network, credentials or user database are touched.
+    actor Replies {
+        var values: [Result<String, RecognitionError>]
+        var calls = 0
+        init(_ values: [Result<String, RecognitionError>]) { self.values = values }
+        func next() throws -> String {
+            calls += 1
+            return try values.removeFirst().get()
+        }
+    }
+    let corrected = try payload([futureAction])
+    let correctionReplies = Replies([.success("not JSON"), .success(corrected)])
+    let correctingClient = DeepSeekClient(configuration: .init()) { _, _ in try await correctionReplies.next() }
+    guard case .schedule = try await correctingClient.interpret(futureText, now: now) else {
+        throw RecognitionError.invalid("纠错后没有安排有效事项")
+    }
+    let correctionCount = await correctionReplies.calls
+    try check(correctionCount == 2, "假模型无效 JSON 仅纠错一次")
+
+    let invalidReplies = Replies([.success("not JSON"), .success("still invalid")])
+    let invalidClient = DeepSeekClient(configuration: .init()) { _, _ in try await invalidReplies.next() }
+    var invalidPending = ReminderItem(text: futureText, now: now)
+    do {
+        _ = try await invalidClient.interpret(futureText, now: now)
+        throw RecognitionError.invalid("两次无效 JSON 未报错")
+    } catch RecognitionError.invalid {
+        invalidPending.fail("模型结构无效", now: now)
+        try store.upsert(invalidPending)
+    }
+    let invalidCount = await invalidReplies.calls
+    try check(invalidCount == 2 &&
+              (try store.all()).contains(where: { $0.id == invalidPending.id && $0.originalText == futureText && $0.recognition == .needsAttention && $0.firstReminder == nil }),
+              "假模型两次无效后原话持久待识别，未静默排期")
+
+    let timeoutReplies = Replies([.failure(.connection("请求超时"))])
+    let timeoutClient = DeepSeekClient(configuration: .init()) { _, _ in try await timeoutReplies.next() }
+    var timeoutPending = ReminderItem(text: futureText, now: now)
+    do {
+        _ = try await timeoutClient.interpret(futureText, now: now)
+        throw RecognitionError.invalid("超时未报错")
+    } catch RecognitionError.connection {
+        timeoutPending.fail("请求超时", now: now)
+        try store.upsert(timeoutPending)
+    }
+    let timeoutCount = await timeoutReplies.calls
+    try check(timeoutCount == 1 &&
+              (try store.all()).contains(where: { $0.id == timeoutPending.id && $0.originalText == futureText && $0.recognition == .needsAttention && $0.firstReminder == nil }),
+              "假模型超时不纠错，原话持久待识别")
+
+    let splitReplies = Replies([.success(try payload([firstAction, futureAction]))])
+    let splitClient = DeepSeekClient(configuration: .init()) { _, _ in try await splitReplies.next() }
+    guard case .separateEntries = try await splitClient.interpret(doubleText, now: now) else {
+        throw RecognitionError.invalid("多行动没有提示分录")
+    }
+    let splitCount = await splitReplies.calls
+    try check(splitCount == 1, "假模型多行动直接分录，不尝试纠错")
+
+    var expiredDuringResponse = ReminderItem(text: futureText, now: now)
+    try expiredDuringResponse.apply(.init(title: "已到时间", reminder: now.addingTimeInterval(30),
+                                            deadline: nil, suggestedCompletion: nil),
+                                    now: now.addingTimeInterval(120))
+    try check(expiredDuringResponse.nextReminder == now.addingTimeInterval(120),
+              "模型响应期间刚过期的提醒立即到期，不进入失败状态")
+
     let prompt = try DeepSeekClient.systemPrompt(now: now)
     try check(!prompt.contains("今天2026-09-29") && prompt.contains("时区") && prompt.contains("分两次录入"), "生产提示词没有写死实验日期且说明分录")
 
@@ -345,7 +410,7 @@ func run() throws {
 }
 
 do {
-    try run()
+    try await run()
     print("全部核心检查通过")
 } catch {
     fputs("核心检查失败：\(error)\n", stderr)

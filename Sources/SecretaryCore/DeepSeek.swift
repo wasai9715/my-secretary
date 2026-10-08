@@ -12,7 +12,13 @@ public enum InterpretationDecision: Sendable, Equatable {
 
 public struct DeepSeekClient: Sendable {
     public let configuration: AIConfiguration
-    public init(configuration: AIConfiguration) { self.configuration = configuration }
+    private let transport: (@Sendable (String, String) async throws -> String)?
+
+    public init(configuration: AIConfiguration,
+                transport: (@Sendable (String, String) async throws -> String)? = nil) {
+        self.configuration = configuration
+        self.transport = transport
+    }
 
     public func testConnection() async throws {
         let response = try await chat(system: "请仅返回 JSON 对象。", user: "返回 {\"ok\":true}。")
@@ -38,6 +44,29 @@ public struct DeepSeekClient: Sendable {
         return try String(contentsOf: url, encoding: .utf8)
             .replacingOccurrences(of: "{current_local_datetime}", with: timeContext(now: now))
             .replacingOccurrences(of: "{timezone}", with: TimeZone.current.identifier)
+    }
+
+    /// Extract only time changes for the current item. Never modify its wording.
+    public func interpretTimeEdit(_ instruction: String, item: ReminderItem, now: Date = .now) async throws -> TimeEditDecision {
+        let system = """
+        你只解析当前事项的一句话时间调整，不得修改事项标题、内容，也不得执行其他动作。当前本地时间：\(Self.timeContext(now: now))。
+        返回且只返回 JSON 对象，必须包含 kind, reminderAt, deadlineKind, deadlineAt, deadlineDay, unsupportedContent, reason, evidence 全部字段。
+        kind=update/choose_preset/unclear；reminderAt 为下一次提醒的 ISO8601 秒级带时区时刻或 null；deadlineKind=none/instant/day，deadlineAt 为明确截止时刻或 null，deadlineDay 为仅日期截止 yyyy-MM-dd 或 null。只说“提醒”不能推断或改变截止；只说“截止”不能推断或改变提醒。没有提到的字段输出 null。未指定时分的截止只有 deadlineDay，不虚构时刻。
+        “今天下午5点再提醒我”是明确的提醒修改；“截止改为明天下午六点”是明确的截止修改；同时出现则分别给出两个时间。时间是否越过当前明确截止由程序后续验证，不得因此判断语义含糊。
+        例如：“明天九点提醒我，截止改为明天下午六点” -> kind=update，两个字段都有值，deadlineKind=instant。
+        例如：“今天下午五点再提醒我，案例批次号为 ABC123” -> {"kind":"unclear","reminderAt":null,"deadlineKind":"none","deadlineAt":null,"deadlineDay":null,"unsupportedContent":true,"reason":"包含事项内容修改，请在内容框手动编辑","evidence":["今天下午五点再提醒我","案例批次号为 ABC123"]}；绝不能只执行时间部分。
+        例如：“晚点再提醒” -> {"kind":"choose_preset","reminderAt":null,"deadlineKind":"none","deadlineAt":null,"deadlineDay":null,"unsupportedContent":false,"reason":null,"evidence":["晚点再提醒"]}，不猜时间。
+        例如：“明天九点提醒我，截止改为明天下午六点” -> {"kind":"update","reminderAt":"带时区的明天09:00","deadlineKind":"instant","deadlineAt":"带时区的明天18:00","deadlineDay":null,"unsupportedContent":false,"reason":null,"evidence":["明天九点提醒我","截止改为明天下午六点"]}。示例中的时间占位语句必须替换成实际合法的 ISO8601 时间。
+        任何添加批次号、备注、更改标题或内容、完成或取消等非时间要求，均设 unsupportedContent=true；未明确的时间设 kind=unclear。对不支持的操作不可返回部分时间修改。
+        evidence 为覆盖整句指令的原文连续片段数组；只能引用用户这条指令，不得虚构。reason 只在 unclear 时给出简短原因，其余为 null。不要返回长篇解释，只返回 JSON。
+        """
+        let user = "当前内容：\(item.text)\n下次提醒：\(item.nextReminder.map(String.init(describing:)) ?? "无")\n明确截止：\(item.deadline.map(String.init(describing:)) ?? item.deadlineDay ?? "无")\n用户时间指令：\(instruction)"
+        let first = try await chat(system: system, user: user)
+        do { return try TimeEditDecoder.decode(first, instruction: instruction, now: now) }
+        catch {
+            let second = try await chat(system: system, user: "\(user)\n上次输出：\(first)\n校验错误：\(error.localizedDescription)。完整纠正 JSON；不允许部分执行。")
+            return try TimeEditDecoder.decode(second, instruction: instruction, now: now)
+        }
     }
 
     public func interpret(_ text: String, now: Date = .now) async throws -> InterpretationDecision {
@@ -198,6 +227,7 @@ public struct DeepSeekClient: Sendable {
     }
 
     private func chat(system: String, user: String) async throws -> String {
+        if let transport { return try await transport(system, user) }
         guard let url = URL(string: configuration.endpoint), url.scheme == "https", !configuration.token.isEmpty else {
             throw RecognitionError.connection("模型地址须为 HTTPS 且 Token 不能为空")
         }

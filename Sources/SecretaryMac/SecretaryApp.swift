@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 import Carbon
 import UserNotifications
+import ServiceManagement
 import SecretaryCore
 
 struct CaptureFeedback {
@@ -31,13 +32,21 @@ final class SecretaryModel: ObservableObject {
     @Published var message = ""
     @Published var notificationGranted = false
     @Published var focusedNotificationIDs: Set<UUID>?
+    private(set) var lastCapturedID: UUID?
     var onCaptureFeedback: (@MainActor (CaptureFeedback) -> Void)?
     var onItemsChanged: (@MainActor () -> Void)?
     var onPermissionRestored: (@MainActor () -> Void)?
     private var dispatchingIDs: Set<UUID> = []
     private var digestInFlight = false
+    private var recognitionAttempts: [UUID: UUID] = [:]
+    private var commandAttempts: [UUID: UUID] = [:]
+    private var pendingReminderPreview: [UUID: (version: Int, reminder: Date)] = [:]
+    private var pendingEditPreview: [UUID: (version: Int, edit: TimeEdit)] = [:]
+    private var pendingTimeDeadline: [UUID: (version: Int, edit: TimeEdit)] = [:]
     // Diagnostics replace the transport, not the scheduling/commit path.
     var notificationOverride: ((String, String, [UUID], @escaping @MainActor (Bool) -> Void) -> Void)?
+    var interpretationOverride: ((String, Date) async throws -> InterpretationDecision)?
+    var timeEditOverride: ((String, ReminderItem) async throws -> TimeEditDecision)?
     let files: LocalFiles
     let store: ItemStore
 
@@ -68,46 +77,231 @@ final class SecretaryModel: ObservableObject {
         guard configuration.verified else { message = "请先测试 DeepSeek 连接"; return false }
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return false }
-        var item = ReminderItem(text: text)
-        do { try store.upsert(item); items.insert(item, at: 0); onItemsChanged?() }
+        let item = ReminderItem(text: text)
+        do { try store.upsert(item); items.insert(item, at: 0); lastCapturedID = item.id; onItemsChanged?() }
         catch { message = "本机保存失败：\(error.localizedDescription)"; return false }
         message = "已记下，正在安排提醒"
-        // Keep the in-flight state in the menu bar; one completed result gets
-        // one unobtrusive feedback card instead of replacing a second card.
+        startRecognition(for: item)
+        return true
+    }
+
+    // Reuse the capture path for explicit retries; only the captured attempt may commit.
+    private func startRecognition(for item: ReminderItem) {
         let version = item.manualVersion
+        let attempt = UUID()
+        recognitionAttempts[item.id] = attempt
+        let transport = interpretationOverride
         let client = DeepSeekClient(configuration: configuration)
         Task {
             do {
-                let result = try await client.interpret(text, now: item.createdAt)
-                guard let current = items.first(where: { $0.id == item.id }), current.manualVersion == version, current.status == .open else { return }
-                item = current
+                let result: InterpretationDecision
+                if let transport {
+                    result = try await transport(item.originalText, item.createdAt)
+                } else {
+                    result = try await client.interpret(item.originalText, now: item.createdAt)
+                }
+                guard var current = items.first(where: { $0.id == item.id }),
+                      current.manualVersion == version, current.status == .open,
+                      current.recognition == .interpreting,
+                      recognitionAttempts[item.id] == attempt else { return }
                 switch result {
                 case .schedule(let interpretation):
-                    try item.apply(interpretation)
-                    guard update(item) else { return }
-                    let reminder = item.nextReminder?.formatted(date: .abbreviated, time: .shortened) ?? "待确认"
-                    message = "已安排：\(reminder) 提醒"
-                    onCaptureFeedback?(CaptureFeedback(item: item))
+                    try current.apply(interpretation)
+                    guard update(current) else { return }
+                    // Success is shown once in the short feedback card; do not
+                    // leave a permanent banner in the shared management message.
+                    message = ""
+                    onCaptureFeedback?(CaptureFeedback(item: current))
                 case .separateEntries(let reason):
-                    item.fail(reason, needsSeparateEntries: true)
-                    guard update(item) else { return }
+                    current.fail(reason, needsSeparateEntries: true)
+                    guard update(current) else { return }
                     message = reason
-                    sendNotification(title: "请分两次录入", body: "原话已保存，包含多个分别需要提醒的行动。点击查看。", ids: [item.id])
+                    sendNotification(title: "请分两次录入", body: "原话已保存，包含多个分别需要提醒的行动。点击查看。", ids: [current.id])
                 case .needsConfirmation(let reason):
-                    item.fail(reason)
-                    guard update(item) else { return }
+                    current.fail(reason)
+                    guard update(current) else { return }
                     message = reason
-                    sendNotification(title: "时间待确认", body: "\(item.title) — 点击查看或设置时间", ids: [item.id])
+                    sendNotification(title: "时间待确认", body: "\(current.title) — 点击查看或设置时间", ids: [current.id])
                 }
             } catch {
-                guard var current = items.first(where: { $0.id == item.id }), current.manualVersion == version, current.status == .open else { return }
+                guard var current = items.first(where: { $0.id == item.id }),
+                      current.manualVersion == version, current.status == .open,
+                      current.recognition == .interpreting,
+                      recognitionAttempts[item.id] == attempt else { return }
                 current.fail(error.localizedDescription)
                 guard update(current) else { return }
                 message = "识别失败：\(current.title)"
                 sendNotification(title: "提醒尚未安排", body: "\(current.title) — 点击设置时间或重试", ids: [current.id])
             }
         }
+    }
+
+    @discardableResult
+    func retryRecognition(_ id: UUID) -> Bool {
+        guard configuration.verified else { message = "请先测试 DeepSeek 连接"; return false }
+        guard var item = items.first(where: { $0.id == id }), item.status == .open,
+              item.recognition == .needsAttention, item.needsSeparateEntries != true else {
+            message = "只有识别失败的待处理事项可以重试；多行动请分别录入"
+            return false
+        }
+        // A manual edit, including one without a reminder, must never be undone by AI.
+        guard item.manualVersion == 0, item.text == item.originalText else {
+            message = "事项已手动修改，请手动设置提醒时间"
+            return false
+        }
+        item.recognition = .interpreting
+        item.failure = nil
+        item.nextReminder = nil
+        guard update(item) else { return false }
+        message = "正在重新识别"
+        startRecognition(for: item)
         return true
+    }
+
+    @discardableResult
+    func undoCapture(_ id: UUID) -> Bool {
+        guard let item = items.first(where: { $0.id == id }),
+              item.status == .open, Date().timeIntervalSince(item.createdAt) < 120 else {
+            message = "撤销时间已结束"
+            return false
+        }
+        do {
+            try store.delete(id)
+            items.removeAll { $0.id == id }
+            if lastCapturedID == id { lastCapturedID = nil }
+            onItemsChanged?()
+            message = "已撤销录入"
+            return true
+        } catch { message = "撤销失败：\(error.localizedDescription)"; return false }
+    }
+
+    @discardableResult
+    func clearHistory() -> Bool {
+        let history = items.filter { $0.status != .open }
+        do {
+            for entry in history { try store.delete(entry.id) }
+            items.removeAll { $0.status != .open }
+            onItemsChanged?()
+            message = "已清空历史事项"
+            return true
+        } catch {
+            items = (try? store.all()) ?? items
+            message = "清空历史未完成：\(error.localizedDescription)"
+            onItemsChanged?()
+            return false
+        }
+    }
+
+    enum CommandOutcome {
+        case applied
+        case preview(Date)
+        case previewEdit(TimeEdit)
+        case choosePreset
+        case needsDeadlineConfirmation
+        case rejected(String)
+    }
+
+    func previewReminderCommand(_ id: UUID, instruction: String) async -> CommandOutcome {
+        guard configuration.verified, let item = items.first(where: { $0.id == id }), item.status == .open else {
+            return .rejected("模型未连接或事项不再待处理")
+        }
+        let attempt = UUID()
+        commandAttempts[id] = attempt
+        pendingReminderPreview[id] = nil
+        do {
+            let decision: TimeEditDecision
+            if let timeEditOverride { decision = try await timeEditOverride(instruction, item) }
+            else { decision = try await DeepSeekClient(configuration: configuration).interpretTimeEdit(instruction, item: item) }
+            guard commandAttempts[id] == attempt,
+                  let current = items.first(where: { $0.id == id }),
+                  current.status == .open, current.manualVersion == item.manualVersion else {
+                return .rejected("事项已变化，请重新解析时间")
+            }
+            switch decision {
+            case .update(let edit) where edit.reminder != nil && edit.deadline == nil:
+                let date = edit.reminder!
+                guard date > .now else { return .rejected("请选择将来的提醒时间") }
+                pendingReminderPreview[id] = (current.manualVersion, date)
+                return .preview(date)
+            case .update: return .rejected("这里仅调整下次提醒；截止时间请在编辑窗口中修改")
+            case .choosePreset: return .choosePreset
+            case .unclear(let reason): return .rejected(reason)
+            }
+        } catch { return .rejected("时间理解失败：\(error.localizedDescription)") }
+    }
+
+    func previewEditCommand(_ id: UUID, instruction: String) async -> CommandOutcome {
+        guard configuration.verified, let item = items.first(where: { $0.id == id }), item.status == .open else {
+            return .rejected("模型未连接或事项不再待处理")
+        }
+        let attempt = UUID()
+        commandAttempts[id] = attempt
+        pendingEditPreview[id] = nil
+        do {
+            let decision: TimeEditDecision
+            if let timeEditOverride { decision = try await timeEditOverride(instruction, item) }
+            else { decision = try await DeepSeekClient(configuration: configuration).interpretTimeEdit(instruction, item: item) }
+            guard commandAttempts[id] == attempt,
+                  let current = items.first(where: { $0.id == id }), current.status == .open,
+                  current.manualVersion == item.manualVersion else {
+                return .rejected("事项已变化，请重新解析")
+            }
+            switch decision {
+            case .update(let edit):
+                guard edit.reminder == nil || edit.reminder! > .now else { return .rejected("请选择将来的提醒时间") }
+                pendingEditPreview[id] = (current.manualVersion, edit)
+                return .previewEdit(edit)
+            case .unclear(let reason): return .rejected(reason)
+            case .choosePreset: return .choosePreset
+            }
+        } catch { return .rejected("操作理解失败：\(error.localizedDescription)") }
+    }
+
+    func confirmEditPreview(_ id: UUID) -> CommandOutcome {
+        guard let pending = pendingEditPreview.removeValue(forKey: id),
+              let current = items.first(where: { $0.id == id }), current.status == .open,
+              current.manualVersion == pending.version else {
+            return .rejected("事项已变化，请重新解析")
+        }
+        do {
+            let proposed = try pending.edit.proposedChange(to: current)
+            return update(proposed) ? .applied : .rejected(message)
+        } catch {
+            let reason = error.localizedDescription
+            if reason.contains("提醒晚于明确截止") || { if case RecognitionError.deadlineConflict = error { return true }; return false }() {
+                pendingTimeDeadline[id] = pending
+                return .needsDeadlineConfirmation
+            }
+            return .rejected(reason)
+        }
+    }
+
+    func confirmReminderPreview(_ id: UUID) -> CommandOutcome {
+        guard let pending = pendingReminderPreview.removeValue(forKey: id),
+              let current = items.first(where: { $0.id == id }), current.status == .open,
+              current.manualVersion == pending.version else {
+            return .rejected("事项已变化，请重新解析时间")
+        }
+        let beyondInstant = current.deadline.map { pending.reminder > $0 } == true
+        let beyondDay = current.deadlineDay.flatMap(ReminderItem.endOfLocalDay)
+            .map { pending.reminder >= $0 } == true
+        if beyondInstant || beyondDay {
+            pendingTimeDeadline[id] = (current.manualVersion, TimeEdit(reminder: pending.reminder))
+            return .needsDeadlineConfirmation
+        }
+        return snooze(current, until: pending.reminder) ? .applied : .rejected(message)
+    }
+
+    func confirmDeadlineCommand(_ id: UUID) -> CommandOutcome {
+        if let pendingTime = pendingTimeDeadline.removeValue(forKey: id),
+           let current = items.first(where: { $0.id == id }), current.status == .open,
+           current.manualVersion == pendingTime.version {
+            do {
+                let proposed = try pendingTime.edit.proposedChange(to: current, overrideDeadline: true)
+                return update(proposed) ? .applied : .rejected(message)
+            } catch { return .rejected(error.localizedDescription) }
+        }
+        return .rejected("事项已发生变化，请重新解析时间")
     }
 
     func testAndSave(endpoint: String, model: String, token: String) async {
@@ -130,7 +324,8 @@ final class SecretaryModel: ObservableObject {
     // immutable; editing never starts another AI interpretation.
     func editDetails(_ item: ReminderItem, title: String, text: String, reminder: Date?,
                      deadline: Date?, deadlineDay: String?, clearPeriod: Bool,
-                     resolvesSingleAction: Bool, restoreSplit: Bool = false) -> Bool {
+                     resolvesSingleAction: Bool, restoreSplit: Bool = false,
+                     overrideDeadline: Bool = false) -> Bool {
         guard let current = items.first(where: { $0.id == item.id }) else { return false }
         let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -144,14 +339,21 @@ final class SecretaryModel: ObservableObject {
         }
         var updated = current
         updated.title = title
+        if text != current.text {
+            if updated.initialCaptureText == nil { updated.initialCaptureText = current.originalText }
+            updated.originalText = text
+        }
         updated.text = text
+        if text != current.text && reminder == current.nextReminder {
+            updated.timeUnchangedAfterContentEdit = true
+        }
         if restoreSplit && current.needsSeparateEntries == true { updated.status = .open }
         updated.deadline = deadline
         updated.deadlineDay = deadlineDay
         if clearPeriod { updated.deadlinePeriod = nil; updated.deadlinePeriodDay = nil }
         if let reminder, reminder != current.nextReminder || current.needsSeparateEntries == true {
             if current.needsSeparateEntries == true { updated.needsSeparateEntries = false }
-            do { try updated.snooze(until: reminder, overrideDeadline: true) }
+            do { try updated.snooze(until: reminder, overrideDeadline: overrideDeadline) }
             catch { message = error.localizedDescription; return false }
         } else {
             updated.nextReminder = reminder
@@ -196,12 +398,12 @@ final class SecretaryModel: ObservableObject {
         } catch { message = error.localizedDescription; return false }
     }
 
-    func restore(_ item: ReminderItem, until date: Date) -> Bool {
+    func restore(_ item: ReminderItem, until date: Date, overrideDeadline: Bool = false) -> Bool {
         guard let current = items.first(where: { $0.id == item.id }), current.status != .open else { return false }
         var updated = current
         updated.status = .open
         do {
-            try updated.snooze(until: date, overrideDeadline: true)
+            try updated.snooze(until: date, overrideDeadline: overrideDeadline)
             guard update(updated) else { return false }
             message = ""
             return true
@@ -350,6 +552,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
     var model: SecretaryModel!
     private var statusItem: NSStatusItem!
     private var permissionItem: NSMenuItem?
+    private var undoCaptureItem: NSMenuItem?
     private var processingItem: NSMenuItem?
     private var feedbackWindow: NSPanel?
     private var feedbackScreen: NSScreen?
@@ -395,6 +598,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
             center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 Task { @MainActor [weak self] in self?.tick() }
             }
+        }
+        if ProcessInfo.processInfo.arguments.contains("--check-capture-enter") {
+            checkCaptureEnter()
+            return
+        }
+        if ProcessInfo.processInfo.arguments.contains("--check-command-actions") {
+            Task {
+                do { try await checkCommandActions(); NSApp.terminate(nil) }
+                catch { fputs("指令操作检查失败：\(error)\n", stderr); exit(114) }
+            }
+            return
+        }
+        if ProcessInfo.processInfo.arguments.contains("--check-permission-ui") {
+            checkPermissionUI()
+            return
+        }
+        if ProcessInfo.processInfo.arguments.contains("--check-login-launch") {
+            checkLoginLaunchStatus()
+            return
+        }
+        if ProcessInfo.processInfo.arguments.contains("--check-real-notification") {
+            Task {
+                do { try await checkRealNotification(); NSApp.terminate(nil) }
+                catch { fputs("真实通知 API 检查失败：\(error)\n", stderr); exit(130) }
+            }
+            return
+        }
+        if ProcessInfo.processInfo.arguments.contains("--check-notification-route") {
+            checkNotificationRoute()
+            return
+        }
+        if ProcessInfo.processInfo.arguments.contains("--check-success-banner") {
+            Task {
+                do { try await checkSuccessBanner(); NSApp.terminate(nil) }
+                catch { fputs("成功提示生命周期检查失败：\(error)\n", stderr); exit(137) }
+            }
+            return
+        }
+        if ProcessInfo.processInfo.arguments.contains("--check-post-save-route") {
+            checkPostSaveRoute()
+            return
+        }
+        if ProcessInfo.processInfo.arguments.contains("--check-management-list") {
+            checkManagementList()
+            return
+        }
+        if ProcessInfo.processInfo.arguments.contains("--check-recognition-race") {
+            Task {
+                do { try await checkRecognitionRace(); NSApp.terminate(nil) }
+                catch { fputs("迟到识别检查失败：\(error)\n", stderr); exit(99) }
+            }
+            return
         }
         if ProcessInfo.processInfo.arguments.contains("--check-reminder-dispatch") {
             checkReminderDispatch()
@@ -612,6 +867,549 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
         }
     }
 
+    private func checkRealNotification() async throws {
+        let center = UNUserNotificationCenter.current()
+        let authorization = await withCheckedContinuation { (continuation: CheckedContinuation<Int, Never>) in
+            center.getNotificationSettings { value in
+                let raw = value.authorizationStatus.rawValue
+                DispatchQueue.main.async { continuation.resume(returning: raw) }
+            }
+        }
+        guard authorization == UNAuthorizationStatus.authorized.rawValue else {
+            throw RecognitionError.invalid("通知未授权；不要在自动检查中修改用户权限")
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SecretaryRealNotice-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        model = try SecretaryModel(files: LocalFiles(directory: directory))
+        model.notificationGranted = true
+        let now = Date()
+        var entries: [ReminderItem] = []
+        for number in 1...6 {
+            var item = ReminderItem(text: "虚构通知测试事项 \(number)", now: now.addingTimeInterval(-3600))
+            try item.apply(.init(title: "测试项\(number)", reminder: now.addingTimeInterval(-10),
+                                 deadline: nil, suggestedCompletion: nil), now: now.addingTimeInterval(-3600))
+            if number == 1 { item.notificationsSent = 1 }
+            guard model.update(item) else { throw RecognitionError.invalid("测试事项未保存") }
+            entries.append(item)
+        }
+        let expected = Set(entries.map(\.id.uuidString))
+        let title = "MySecretary 测试：6 件待处理"
+        let body = ReminderSchedule.summary(entries)
+        guard body.contains("另有 3 件") else { throw RecognitionError.invalid("短标题溢出未显示") }
+        let sent = await withCheckedContinuation { continuation in
+            model.sendNotification(title: title, body: body, ids: entries.map(\.id)) { success in
+                continuation.resume(returning: success)
+            }
+        }
+        guard sent else { throw RecognitionError.invalid("通知中心未接受测试通知") }
+        let delivered = await withCheckedContinuation { (continuation: CheckedContinuation<[(String, String, [String])], Never>) in
+            center.getDeliveredNotifications { value in
+                let rows = value.map { notification in
+                    let ids = notification.request.content.userInfo["itemIDs"] as? [String] ?? []
+                    return (notification.request.identifier, notification.request.content.title, ids)
+                }
+                DispatchQueue.main.async { continuation.resume(returning: rows) }
+            }
+        }
+        let matching = delivered.filter { _, notificationTitle, ids in
+            notificationTitle == title && Set(ids) == expected
+        }
+        center.removeDeliveredNotifications(withIdentifiers: matching.map { $0.0 })
+        guard matching.count == 1 else {
+            print("真实通知 API 已接受测试请求；Notification Center 当前可查询到 \(matching.count) 条（可能受勿扰/系统折叠影响，不宣称已显示或被看见）")
+            return
+        }
+        print("系统通知中心接受并记录一条带六项关联 ID 与短标题溢出的测试通知；已移除测试通知，未改真实事项")
+    }
+
+    private func checkNotificationRoute() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SecretaryRoute-\(UUID().uuidString)")
+        do {
+            model = try SecretaryModel(files: LocalFiles(directory: directory))
+            let now = Date()
+            let entries = try (1...6).map { number -> ReminderItem in
+                var entry = ReminderItem(text: "合并测试原话 \(number)", now: now.addingTimeInterval(-3600))
+                try entry.apply(.init(title: "标题\(number)", reminder: now.addingTimeInterval(-10),
+                                      deadline: nil, suggestedCompletion: nil), now: now.addingTimeInterval(-3600))
+                guard model.update(entry) else { throw RecognitionError.invalid("无法保存合并测试事项") }
+                return entry
+            }
+            let payload: [String: Any] = ["itemIDs": entries.map { $0.id.uuidString }]
+            openNotificationPayload(payload)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                guard let self, let web = self.managementWeb?.webView else { exit(126) }
+                let script = """
+                (()=>{const rows=[...document.querySelectorAll('#c-rows .c-line')];return JSON.stringify({count:rows.length,focus:document.querySelector('#c-notices')?.innerText,titles:rows.map(row=>row.innerText.slice(0,10))})})()
+                """
+                web.evaluateJavaScript(script) { value, error in
+                    guard error == nil, let text = value as? String, text.contains("\"count\":6"),
+                          text.contains("仅显示这次提醒"), (1...6).allSatisfy({ text.contains("标题\($0)") }) else {
+                        fputs("通知关联页面失败：\(String(describing: value)) \(String(describing: error))\n", stderr)
+                        exit(127)
+                    }
+                    web.evaluateJavaScript("document.querySelector('#show-all').click()") { _, _ in
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                            web.evaluateJavaScript("!document.querySelector('#show-all')") { restored, error in
+                                try? FileManager.default.removeItem(at: directory)
+                                guard error == nil, (restored as? NSNumber)?.boolValue == true else {
+                                    fputs("通知恢复全部失败：\(String(describing: restored)) \(String(describing: error))\n", stderr)
+                                    exit(128)
+                                }
+                                print("合并通知关联六项、路由完整集合并可切回全部：通过")
+                                NSApp.terminate(nil)
+                            }
+                        }
+                    }
+                }
+            }
+        } catch { fputs("通知关联测试失败：\(error)\n", stderr); exit(129) }
+    }
+
+    private func checkPermissionUI() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SecretaryPermission-\(UUID().uuidString)")
+        do {
+            model = try SecretaryModel(files: LocalFiles(directory: directory))
+            guard model.update(ReminderItem(text: "虚构待处理事项")) else { exit(119) }
+            model.notificationGranted = false
+            model.onItemsChanged = { [weak self] in self?.updateStatusMenu(); self?.managementWeb?.refresh() }
+            updateStatusMenu()
+            guard permissionItem?.isHidden == false,
+                  permissionItem?.title.contains("1 件待处理") == true else { exit(120) }
+            showManagement()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                self?.model.notificationGranted = false
+                self?.model.onItemsChanged?()
+                self?.updateStatusMenu()
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                guard let self, let web = self.managementWeb?.webView else { exit(121) }
+                web.evaluateJavaScript("document.querySelector('#c-notices')?.innerText + ' / ' + !!document.querySelector('#permission')") { value, error in
+                    guard error == nil, (value as? String)?.contains("通知未开启") == true && (value as? String)?.contains("/ true") == true else {
+                        fputs("权限页面失败：\(String(describing: value)) \(String(describing: error))\n", stderr)
+                        exit(122)
+                    }
+                    self.model.notificationGranted = true
+                    self.model.onItemsChanged?()
+                    self.updateStatusMenu()
+                    guard self.permissionItem?.isHidden == true else { exit(123) }
+                    web.evaluateJavaScript("!document.querySelector('#permission')") { restored, error in
+                        try? FileManager.default.removeItem(at: directory)
+                        guard error == nil, (restored as? NSNumber)?.boolValue == true else {
+                            fputs("权限恢复页面失败：\(String(describing: restored)) \(String(describing: error))\n", stderr)
+                            exit(124)
+                        }
+                        print("通知不可用时菜单计数与页面入口、恢复后状态消失：通过")
+                        NSApp.terminate(nil)
+                    }
+                }
+            }
+        } catch { fputs("权限 UI 准备失败：\(error)\n", stderr); exit(125) }
+    }
+
+    private func checkCaptureEnter() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SecretaryCapture-\(UUID().uuidString)")
+        do {
+            model = try SecretaryModel(files: LocalFiles(directory: directory))
+            model.configuration.verified = true
+            model.interpretationOverride = { _, _ in .needsConfirmation("假模型待确认") }
+            showCapture()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
+                guard let self, let panel = self.panel, let editor = panel.firstResponder as? NSTextView else { exit(115) }
+                editor.string = "周五上线，下周一检查结果"
+                guard let enter = NSEvent.keyEvent(with: .keyDown, location: .zero,
+                                                   modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                                   windowNumber: panel.windowNumber, context: nil,
+                                                   characters: "\r", charactersIgnoringModifiers: "\r",
+                                                   isARepeat: false, keyCode: 36) else { exit(116) }
+                panel.sendEvent(enter)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    let first = self.model.items.first
+                    guard panel.isVisible == false, first?.originalText == "周五上线，下周一检查结果",
+                          self.model.add("周五上线，下周一检查结果"),
+                          self.model.items.count == 2,
+                          Set(self.model.items.map(\.id)).count == 2,
+                          (try? self.model.store.all().count) == 2 else { exit(117) }
+                    try? FileManager.default.removeItem(at: directory)
+                    print("录入 Enter 落盘即收起、复合原话完整、重复原话独立保存：通过")
+                    NSApp.terminate(nil)
+                }
+            }
+        } catch { fputs("录入检查准备失败：\(error)\n", stderr); exit(118) }
+    }
+
+    private func checkCommandActions() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SecretaryCommand-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        model = try SecretaryModel(files: LocalFiles(directory: directory))
+        model.configuration.verified = true
+        let initial = Date()
+        var item = ReminderItem(text: "查订单", now: initial)
+        try item.apply(.init(title: "查订单", reminder: initial.addingTimeInterval(3600),
+                             deadline: initial.addingTimeInterval(7200), suggestedCompletion: nil))
+        guard model.update(item) else { throw RecognitionError.invalid("准备指令测试失败") }
+        let safePreviewDate = initial.addingTimeInterval(6000)
+        model.timeEditOverride = { _, _ in .update(TimeEdit(reminder: safePreviewDate)) }
+        guard case .preview = await model.previewReminderCommand(item.id, instruction: "稍早一些提醒"),
+              model.items.first?.nextReminder == initial.addingTimeInterval(3600),
+              case .applied = model.confirmReminderPreview(item.id),
+              model.items.first?.nextReminder == safePreviewDate else {
+            throw RecognitionError.invalid("普通提醒解析未按预览／确认两步执行")
+        }
+        model.timeEditOverride = { _, _ in .choosePreset }
+        showManagement()
+        try await Task.sleep(for: .seconds(2))
+        guard let web = managementWeb?.webView else { throw RecognitionError.invalid("当前事项页面未打开") }
+        let submitted = try await web.evaluateJavaScript("""
+        (()=>{document.querySelector('[data-filter="later"]')?.click();document.querySelector('[data-action="snooze"]')?.click();const form=document.querySelector('#c-reminder-command');if(!form)return '未显示提醒输入';form.elements.instruction.value='晚点';form.requestSubmit();return 'submitted'})()
+        """) as? String
+        guard submitted == "submitted" else { throw RecognitionError.invalid(submitted ?? "指令输入未提交") }
+        try await Task.sleep(for: .milliseconds(300))
+        let shown = try await web.evaluateJavaScript("document.querySelector('#c-reminder-preview')?.innerText.includes('选择上面的预设')") as? Bool
+        guard shown == true else { throw RecognitionError.invalid("晚点没有提示选择预设") }
+        let previewDate = initial.addingTimeInterval(9300)
+        model.timeEditOverride = { _, _ in .update(TimeEdit(reminder: previewDate)) }
+        let submittedPreview = try await web.evaluateJavaScript("""
+        (()=>{const form=document.querySelector('#c-reminder-command');form.elements.instruction.value='三小时后提醒';form.requestSubmit();return true})()
+        """) as? Bool
+        guard submittedPreview == true else { throw RecognitionError.invalid("未提交自然语言时间") }
+        try await Task.sleep(for: .milliseconds(300))
+        let hasPreview = try await web.evaluateJavaScript("document.querySelector('#c-reminder-preview')?.innerText.includes('将改为')") as? Bool
+        guard hasPreview == true, model.items.first?.nextReminder == safePreviewDate else {
+            throw RecognitionError.invalid("解析时间时提前修改了提醒")
+        }
+        _ = try await web.evaluateJavaScript("document.querySelector('#c-reminder-preview button')?.click()")
+        try await Task.sleep(for: .milliseconds(200))
+        let warning = try await web.evaluateJavaScript("document.querySelector('#c-reminder-preview')?.innerText.includes('晚于明确截止')") as? Bool
+        guard warning == true, model.items.first?.nextReminder == safePreviewDate else {
+            throw RecognitionError.invalid("超过截止未要求再次确认")
+        }
+        let revisedDeadline = initial.addingTimeInterval(10_800)
+        model.timeEditOverride = { _, _ in .update(TimeEdit(reminder: initial.addingTimeInterval(9600),
+                                                           deadline: .instant(revisedDeadline))) }
+        let edited = try await web.evaluateJavaScript("""
+        (()=>{document.querySelector('[data-filter="later"]')?.click();document.querySelector('[data-action="edit"]')?.click();const form=document.querySelector('#c-edit-command');if(!form)return '编辑中无指令输入';form.elements.instruction.value='明天九点提醒我，截止改为明天下午六点';form.requestSubmit();return 'submitted'})()
+        """) as? String
+        guard edited == "submitted" else { throw RecognitionError.invalid(edited ?? "编辑指令不可用") }
+        try await Task.sleep(for: .milliseconds(300))
+        let editPreview = try await web.evaluateJavaScript("document.querySelector('#c-edit-preview')?.innerText.includes('提醒改为') && document.querySelector('#c-edit-preview')?.innerText.includes('明确截止改为') && !document.querySelector('#c-edit-preview')?.innerText.includes('内容改为')") as? Bool
+        guard editPreview == true, model.items.first?.text == "查订单",
+              model.items.first?.deadline == item.deadline else {
+            throw RecognitionError.invalid("编辑时间预览提前提交或修改了内容")
+        }
+        _ = try await web.evaluateJavaScript("document.querySelector('#c-edit-preview button')?.click()")
+        try await Task.sleep(for: .milliseconds(200))
+        guard model.items.first?.nextReminder == initial.addingTimeInterval(9600),
+              model.items.first?.deadline == revisedDeadline, model.items.first?.text == "查订单" else {
+            throw RecognitionError.invalid("提醒与截止未一起提交或误修改内容")
+        }
+        print("提醒与截止分别预览后原子提交，内容不受模型修改；含糊提醒不猜时间：通过")
+    }
+
+    private func checkSuccessBanner() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SecretarySuccessBanner-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        model = try SecretaryModel(files: LocalFiles(directory: directory))
+        model.configuration.verified = true
+        model.interpretationOverride = { _, _ in
+            .schedule(Interpretation(title: "演示事项", reminder: Date().addingTimeInterval(3600),
+                                     deadline: nil, suggestedCompletion: nil))
+        }
+        guard model.add("演示事项") else { throw RecognitionError.invalid("未保存测试事项") }
+        for _ in 0..<100 {
+            if model.items.first?.recognition == .ready { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        guard model.items.first?.recognition == .ready else { throw RecognitionError.invalid("假模型结果未完成") }
+        showManagement()
+        try await Task.sleep(for: .seconds(2))
+        guard let web = managementWeb?.webView else { throw RecognitionError.invalid("管理页面未加载") }
+        let banner = try await web.evaluateJavaScript("document.querySelector('#c-notices')?.innerText || ''") as? String ?? ""
+        guard !banner.contains("已安排："), model.message.isEmpty else {
+            throw RecognitionError.invalid("安排成功后旧消息持续留在管理页面：\(banner)")
+        }
+        print("成功仅使用短暂反馈卡，管理页面无常驻已安排消息：通过")
+    }
+
+    private func checkPostSaveRoute() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SecretaryPostSave-\(UUID().uuidString)")
+        do {
+            model = try SecretaryModel(files: LocalFiles(directory: directory))
+            let now = Date()
+            var target = ReminderItem(text: "保存后仍应留在这里", now: now.addingTimeInterval(-3600))
+            try target.apply(.init(title: "目标事项", reminder: now.addingTimeInterval(-60),
+                                   deadline: nil, suggestedCompletion: nil), now: now.addingTimeInterval(-3600))
+            var other = ReminderItem(text: "另一个稍后事项", now: now)
+            try other.apply(.init(title: "其他事项", reminder: now.addingTimeInterval(60),
+                                  deadline: nil, suggestedCompletion: nil), now: now)
+            guard model.update(target), model.update(other) else { exit(132) }
+            let id = target.id.uuidString
+            showManagement()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                guard let self, let web = self.managementWeb?.webView else { exit(133) }
+                let script = """
+                (()=>{const row=document.querySelector('[data-item="\(id)"]');if(!row)return '目标不在当前待处理';row.click();document.querySelector('[data-action="snooze"]')?.click();const preset=document.querySelector('.c-snooze-popover .quick button');if(!preset)return '无预设';preset.click();return 'submitted'})()
+                """
+                web.evaluateJavaScript(script) { value, error in
+                    guard error == nil, value as? String == "submitted" else { exit(134) }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        let assertion = """
+                        (()=>{const row=document.querySelector('.c-line.selected');return JSON.stringify({tab:document.querySelector('[data-filter="later"]')?.classList.contains('chosen'),id:row?.dataset.item,title:document.querySelector('#c-detail h2')?.innerText,note:document.querySelector('.c-saved-note')?.innerText})})()
+                        """
+                        web.evaluateJavaScript(assertion) { result, error in
+                            try? FileManager.default.removeItem(at: directory)
+                            guard error == nil, let text = result as? String,
+                                  text.contains("\"tab\":true"), text.contains(id),
+                                  text.contains("目标事项"), text.contains("已保存") else {
+                                fputs("保存后路由不正确：\(String(describing: result)) \(String(describing: error))\n", stderr)
+                                exit(135)
+                            }
+                            print("当前事项改为未来时间后切到稍后，仍选中原事项并显示已保存：通过")
+                            NSApp.terminate(nil)
+                        }
+                    }
+                }
+            }
+        } catch { fputs("保存后路由准备失败：\(error)\n", stderr); exit(136) }
+    }
+
+    private func checkManagementList() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SecretaryList-\(UUID().uuidString)")
+        do {
+            model = try SecretaryModel(files: LocalFiles(directory: directory))
+            let now = Date()
+            model.settings.presetRules = [ReminderPreset(minutes: 15), ReminderPreset(dayOffset: 1, hour: 9, minute: 0)]
+            var current = ReminderItem(text: "当前原话", now: now.addingTimeInterval(-3600))
+            try current.apply(.init(title: "当前项", reminder: now.addingTimeInterval(-60), deadline: now.addingTimeInterval(300),
+                                    reminderSource: "explicit", timeEvidence: ["当前原话"], suggestedCompletion: nil),
+                              now: now.addingTimeInterval(-3600))
+            var later = ReminderItem(text: "稍后原话", now: now)
+            try later.apply(.init(title: "稍后项", reminder: now.addingTimeInterval(3600), deadline: nil,
+                                  suggestedCompletion: nil), now: now)
+            var pending = ReminderItem(text: "待识别原话", now: now)
+            pending.fail("假模型失败", now: now)
+            var history = current
+            history.id = UUID()
+            history.title = "历史项"
+            history.status = .completed
+            for item in [current, later, pending, history] { guard model.update(item) else { exit(110) } }
+            showManagement()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                guard let self, let web = self.managementWeb?.webView else { exit(111) }
+                let script = """
+                (()=>{if(!document.querySelector('[data-filter="current"]'))return '页面未加载:'+document.URL+':'+document.body?.innerText.slice(0,80);const result=[];for(const [tab,expected] of [['current','当前项'],['later','稍后项'],['attention','待识别原话'],['history','历史项']]){document.querySelector('[data-filter="'+tab+'"]').click();const row=document.querySelector('#c-rows')?.innerText||'';if(!row.includes(expected))return '缺少'+tab+':'+row;result.push(tab)}document.querySelector('[data-filter="current"]').click();const detail=document.querySelector('#c-detail');if(!detail?.innerText.includes('提醒时间来源')||!detail?.innerText.includes('当前原话'))return '来源或原话不可见';detail.querySelector('[data-action="snooze"]').click();const buttons=[...document.querySelectorAll('.c-snooze-popover .quick button')];if(buttons.length!==2||!buttons[1].innerText.includes('明天 09:00'))return '日期预设未显示';buttons[0].click();return document.querySelector('.c-snooze-feedback button')?.innerText.includes('确认越过截止')?'ok':'未提供截止确认'})()
+                """
+                web.evaluateJavaScript(script) { value, error in
+                    try? FileManager.default.removeItem(at: directory)
+                    guard error == nil, value as? String == "ok" else {
+                        fputs("管理列表检查失败：\(String(describing: value)) \(String(describing: error))\n", stderr)
+                        exit(112)
+                    }
+                    print("当前、稍后、待识别、历史与原话/时间来源显示：通过")
+                    NSApp.terminate(nil)
+                }
+            }
+        } catch { fputs("管理列表准备失败：\(error)\n", stderr); exit(113) }
+    }
+
+    private func checkRecognitionRace() async throws {
+        @MainActor final class Gate {
+            var started: CheckedContinuation<Void, Never>?
+            var waiting: CheckedContinuation<InterpretationDecision, Never>?
+            func interpret() async -> InterpretationDecision {
+                started?.resume()
+                started = nil
+                return await withCheckedContinuation { waiting = $0 }
+            }
+            func waitUntilStarted() async {
+                if waiting != nil { return }
+                await withCheckedContinuation { started = $0 }
+            }
+            func release(_ decision: InterpretationDecision) {
+                waiting?.resume(returning: decision)
+                waiting = nil
+            }
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SecretaryRace-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        model = try SecretaryModel(files: LocalFiles(directory: directory))
+        model.configuration.verified = true
+        let text = "测试迟到识别，不写真实事项"
+        let interpretation = Interpretation(title: "迟到的建议", reminder: Date().addingTimeInterval(3600),
+                                            deadline: nil, suggestedCompletion: nil)
+        for operation in ["snooze", "edit", "complete", "cancel"] {
+            let gate = Gate()
+            model.interpretationOverride = { _, _ in await gate.interpret() }
+            guard model.add(text), let item = model.items.first else {
+                throw RecognitionError.invalid("原话未先保存")
+            }
+            await gate.waitUntilStarted()
+            switch operation {
+            case "snooze":
+                guard model.snooze(item, until: Date().addingTimeInterval(7200)) else {
+                    throw RecognitionError.invalid("识别中无法手动改时")
+                }
+            case "edit":
+                guard model.editDetails(item, title: "我自己改的标题", text: "我自己改的内容",
+                                        reminder: Date().addingTimeInterval(5400), deadline: nil,
+                                        deadlineDay: nil, clearPeriod: false, resolvesSingleAction: false) else {
+                    throw RecognitionError.invalid("识别中无法手动改内容")
+                }
+            case "complete":
+                guard model.changeStatus(item, to: .completed) else {
+                    throw RecognitionError.invalid("识别中无法完成")
+                }
+            default:
+                guard model.changeStatus(item, to: .cancelled) else {
+                    throw RecognitionError.invalid("识别中无法取消")
+                }
+            }
+            let expected = model.items.first!
+            gate.release(.schedule(interpretation))
+            try await Task.sleep(for: .milliseconds(150))
+            let saved = try model.store.all().first(where: { $0.id == item.id })
+            guard saved == expected, model.items.first(where: { $0.id == item.id }) == expected else {
+                throw RecognitionError.invalid("迟到结果覆盖了用户操作：\(operation)")
+            }
+            print("识别中\(operation)后迟到模型响应不覆盖：通过")
+        }
+        let gate = Gate()
+        model.interpretationOverride = { _, _ in await gate.interpret() }
+        guard model.add(text), let added = model.items.first else {
+            throw RecognitionError.invalid("撤销测试原话未保存")
+        }
+        await gate.waitUntilStarted()
+        guard model.undoCapture(added.id) else { throw RecognitionError.invalid("识别中无法撤销录入") }
+        gate.release(.schedule(interpretation))
+        try await Task.sleep(for: .milliseconds(150))
+        guard !(try model.store.all()).contains(where: { $0.id == added.id }),
+              !model.items.contains(where: { $0.id == added.id }) else {
+            throw RecognitionError.invalid("迟到响应重新创建了已撤销事项")
+        }
+        print("识别中撤销原话后迟到模型响应不复活：通过")
+        model.interpretationOverride = nil
+        try await checkRecognitionRetry()
+    }
+
+    private func checkRecognitionRetry() async throws {
+        @MainActor final class Gate {
+            var pending: [CheckedContinuation<InterpretationDecision, Error>] = []
+            func interpret() async throws -> InterpretationDecision {
+                try await withCheckedThrowingContinuation { pending.append($0) }
+            }
+            func waitFor(_ count: Int) async {
+                while pending.count < count { await Task.yield() }
+            }
+            func release(_ decision: InterpretationDecision) {
+                pending.removeFirst().resume(returning: decision)
+            }
+            func fail() {
+                pending.removeFirst().resume(throwing: RecognitionError.invalid("假模型无效 JSON"))
+            }
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SecretaryRetry-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        model = try SecretaryModel(files: LocalFiles(directory: directory))
+        model.configuration.verified = true
+        model.notificationOverride = { _, _, _, completion in completion(true) }
+        let gate = Gate()
+        let original = "明天检查订单"
+        var inputs: [String] = []
+        model.interpretationOverride = { text, _ in
+            inputs.append(text)
+            return try await gate.interpret()
+        }
+        guard model.add(original), let item = model.items.first else { throw RecognitionError.invalid("初次录入失败") }
+        await gate.waitFor(1)
+        gate.fail()
+        try await waitForRecognition(item.id, .needsAttention)
+        guard model.retryRecognition(item.id) else { throw RecognitionError.invalid("失败事项无法手动重试") }
+        await gate.waitFor(1)
+        guard !model.retryRecognition(item.id) else { throw RecognitionError.invalid("允许重复并发重试") }
+        gate.fail()
+        try await waitForRecognition(item.id, .needsAttention)
+        guard model.retryRecognition(item.id) else { throw RecognitionError.invalid("二次失败后不能重试") }
+        await gate.waitFor(1)
+        let next = Date().addingTimeInterval(3600)
+        gate.release(.schedule(Interpretation(title: "检查订单", reminder: next, deadline: nil, suggestedCompletion: nil)))
+        try await waitForRecognition(item.id, .ready)
+        guard let saved = try model.store.all().first(where: { $0.id == item.id }),
+              model.items.count == 1, saved.originalText == original, saved.nextReminder != nil,
+              inputs == [original, original, original], !model.retryRecognition(item.id) else {
+            throw RecognitionError.invalid("重试结果未复用原事项和原话")
+        }
+        print("识别失败后手动重试、重复失败再重试、同 ID 原话持久化：通过")
+
+        // A prior result must not overwrite the later retry, even if its response arrives last.
+        var stale = ReminderItem(text: original)
+        stale.fail("旧失败")
+        guard model.update(stale), model.retryRecognition(stale.id) else { throw RecognitionError.invalid("重试旧事项失败") }
+        await gate.waitFor(1)
+        // Simulate an older attempt still running when the item became retryable again.
+        var failed = model.items.first(where: { $0.id == stale.id })!
+        failed.fail("再次失败")
+        guard model.update(failed), model.retryRecognition(stale.id) else { throw RecognitionError.invalid("新一轮重试失败") }
+        await gate.waitFor(2)
+        let newer = Interpretation(title: "新结果", reminder: next, deadline: nil, suggestedCompletion: nil)
+        // Release the older request first, then ensure it cannot commit before the newer response.
+        gate.release(.schedule(Interpretation(title: "旧结果", reminder: next, deadline: nil, suggestedCompletion: nil)))
+        try await Task.sleep(for: .milliseconds(100))
+        guard model.items.first(where: { $0.id == stale.id })?.recognition == .interpreting else {
+            throw RecognitionError.invalid("旧尝试覆盖新重试")
+        }
+        gate.release(.schedule(newer))
+        try await waitForRecognition(stale.id, .ready)
+        guard model.items.first(where: { $0.id == stale.id })?.title == "新结果" else {
+            throw RecognitionError.invalid("新重试结果未保存")
+        }
+        print("旧识别结果不覆盖新重试：通过")
+
+        for operation in ["edit", "complete", "cancel"] {
+            var pending = ReminderItem(text: original)
+            pending.fail("待重试")
+            guard model.update(pending), model.retryRecognition(pending.id) else { throw RecognitionError.invalid("无法启动重试") }
+            await gate.waitFor(1)
+            if operation == "edit" {
+                guard model.editDetails(pending, title: "手动标题", text: "手动内容", reminder: nil,
+                                        deadline: nil, deadlineDay: nil, clearPeriod: false,
+                                        resolvesSingleAction: false) else { throw RecognitionError.invalid("手动编辑失败") }
+            } else {
+                guard model.changeStatus(pending, to: operation == "complete" ? .completed : .cancelled) else {
+                    throw RecognitionError.invalid("修改状态失败")
+                }
+            }
+            let expected = model.items.first(where: { $0.id == pending.id })!
+            gate.release(.schedule(newer))
+            try await Task.sleep(for: .milliseconds(100))
+            guard model.items.first(where: { $0.id == pending.id }) == expected,
+                  (try model.store.all()).first(where: { $0.id == pending.id }) == expected else {
+                throw RecognitionError.invalid("重试覆盖手动操作：\(operation)")
+            }
+        }
+        print("重试期间编辑、完成、取消不被覆盖：通过")
+        var edited = ReminderItem(text: original)
+        edited.fail("待识别")
+        guard model.update(edited), model.editDetails(edited, title: "自己的标题", text: "自己的内容",
+            reminder: nil, deadline: nil, deadlineDay: nil, clearPeriod: false, resolvesSingleAction: false),
+            !model.retryRecognition(edited.id) else {
+            throw RecognitionError.invalid("编辑后仍允许模型重新覆盖")
+        }
+        var split = ReminderItem(text: original)
+        split.fail("两个行动", needsSeparateEntries: true)
+        guard model.update(split), !model.retryRecognition(split.id) else {
+            throw RecognitionError.invalid("需分录事项不能直接重试")
+        }
+        print("已编辑事项与需分录事项拒绝重试：通过")
+        model.interpretationOverride = nil
+    }
+
+    private func waitForRecognition(_ id: UUID, _ status: RecognitionStatus) async throws {
+        for _ in 0..<100 {
+            if model.items.first(where: { $0.id == id })?.recognition == status { return }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        throw RecognitionError.invalid("等待识别状态超时：\(status)")
+    }
+
     private func checkReminderDispatch() {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SecretaryDispatch-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -781,7 +1579,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
                   model.items.first?.nextReminder == original.nextReminder else { exit(94) }
             guard model.changeStatus(original, to: .cancelled) else { exit(95) }
             let newTime = now.addingTimeInterval(3600)
-            guard model.restore(original, until: newTime), model.items.first?.status == .open,
+            guard !model.restore(original, until: newTime),
+                  model.restore(original, until: newTime, overrideDeadline: true), model.items.first?.status == .open,
                   model.items.first?.nextReminder == newTime,
                   model.items.first?.notificationsSent == 0 else { exit(96) }
             let reopened = try SecretaryModel(files: LocalFiles(directory: directory))
@@ -821,6 +1620,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
         let pendingCount = model.items.filter { $0.status == .open }.count
         permissionItem?.title = "⚠️ 通知未开启 · \(pendingCount) 件待处理，打开系统设置"
         processingItem?.isHidden = !processing
+        undoCaptureItem?.isHidden = !model.items.contains {
+            $0.id == model.lastCapturedID && $0.status == .open && Date().timeIntervalSince($0.createdAt) < 120
+        }
     }
 
     private func createStatusMenu() {
@@ -830,6 +1632,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
         let capture = NSMenuItem(title: "记下一件事", action: #selector(showCapture), keyEquivalent: "")
         capture.target = self
         menu.addItem(capture)
+        let undoCapture = NSMenuItem(title: "撤销刚录入的事项", action: #selector(undoLastCapture), keyEquivalent: "")
+        undoCapture.target = self
+        undoCapture.isHidden = true
+        menu.addItem(undoCapture)
+        undoCaptureItem = undoCapture
         let all = NSMenuItem(title: "查看事项", action: #selector(showManagement), keyEquivalent: "")
         all.target = self
         menu.addItem(all)
@@ -868,6 +1675,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
             self?.feedbackWindow?.orderOut(nil)
             self?.model.focusedNotificationIDs = [feedback.itemID]
             self?.presentManagement()
+        }, undo: { [weak self] in
+            guard let self, self.model.undoCapture(feedback.itemID) else { return }
+            self.feedbackWindow?.orderOut(nil)
+            self.feedbackToken = nil
         }))
         // Position against the usable bounds of the screen where capture occurred,
         // not against the menu-bar icon (which can appear far from the right edge).
@@ -891,8 +1702,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
         }
     }
 
+    private func checkLoginLaunchStatus() {
+        do {
+            let status = SMAppService.mainApp.status
+            guard [SMAppService.Status.enabled, .notRegistered, .requiresApproval, .notFound].contains(status) else {
+                fputs("登录启动返回未知状态：\(status.rawValue)\n", stderr)
+                exit(131)
+            }
+            print("登录启动服务状态可查询：\(status.rawValue)\(status == .notFound ? "（当前临时构建未安装，无法验证开机启动）" : "")；未替用户修改系统设置")
+            NSApp.terminate(nil)
+        }
+    }
+
     @objc func openNotificationSettings() {
         SecretaryModel.openSystemNotificationSettings()
+    }
+
+    @objc func undoLastCapture() {
+        guard let id = model.lastCapturedID, model.undoCapture(id) else { return }
+        feedbackWindow?.orderOut(nil)
+        feedbackToken = nil
     }
 
     @objc func showCapture() {
@@ -1040,12 +1869,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
         return true
     }
 
+    private func openNotificationPayload(_ userInfo: [AnyHashable: Any]) {
+        let ids = (userInfo["itemIDs"] as? [String] ?? []).compactMap(UUID.init(uuidString:))
+        model.focusedNotificationIDs = ids.isEmpty ? nil : Set(ids)
+        presentManagement()
+    }
+
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
-        let ids = (response.notification.request.content.userInfo["itemIDs"] as? [String] ?? []).compactMap(UUID.init(uuidString:))
-        await MainActor.run {
-            self.model.focusedNotificationIDs = ids.isEmpty ? nil : Set(ids)
-            self.presentManagement()
-        }
+        let ids = response.notification.request.content.userInfo["itemIDs"] as? [String] ?? []
+        await MainActor.run { self.openNotificationPayload(["itemIDs": ids]) }
     }
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
         [.banner, .sound]

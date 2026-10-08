@@ -6,6 +6,7 @@ public enum RecognitionStatus: String, Codable, Sendable { case interpreting, re
 public struct ReminderItem: Identifiable, Codable, Sendable, Equatable {
     public var id: UUID
     public var originalText: String
+    public var initialCaptureText: String?
     public var text: String
     public var title: String
     public var createdAt: Date
@@ -26,10 +27,12 @@ public struct ReminderItem: Identifiable, Codable, Sendable, Equatable {
     public var notificationsSent: Int
     public var lastUserSnooze: Date?
     public var manualVersion: Int
+    public var timeUnchangedAfterContentEdit: Bool?
 
     public init(text: String, now: Date = .now) {
         id = UUID()
         originalText = text
+        initialCaptureText = text
         self.text = text
         title = text
         createdAt = now
@@ -50,6 +53,7 @@ public struct ReminderItem: Identifiable, Codable, Sendable, Equatable {
         notificationsSent = 0
         lastUserSnooze = nil
         manualVersion = 0
+        timeUnchangedAfterContentEdit = false
     }
 
     public mutating func apply(_ result: Interpretation, now: Date = .now) throws {
@@ -71,8 +75,10 @@ public struct ReminderItem: Identifiable, Codable, Sendable, Equatable {
                 throw RecognitionError.invalid("明确截止事项必须有早于截止的首次提醒")
             }
         }
-        if let date = result.reminder, date.timeIntervalSince(now) < -60 {
-            throw RecognitionError.invalid("建议提醒时间已过")
+        // A valid time at capture can expire while the model is responding.
+        // Reject only times that were already past when the user entered the item.
+        if let date = result.reminder, date < createdAt {
+            throw RecognitionError.invalid("建议提醒时间早于录入时间")
         }
         var first = max(result.reminder ?? createdAt.addingTimeInterval(15 * 60), now)
         if let day = result.deadlineDay {
@@ -138,6 +144,7 @@ public struct ReminderItem: Identifiable, Codable, Sendable, Equatable {
         nextReminder = date
         notificationsSent = 0
         lastUserSnooze = date
+        timeUnchangedAfterContentEdit = false
         manualVersion += 1
         // A manually set time resolves the need for automatic interpretation.
         recognition = .ready
@@ -209,6 +216,7 @@ public struct ReminderSettings: Codable, Sendable {
     public var shortcutModifiers: UInt32 = 0x1200 // control + shift (Carbon key modifier flags)
     public var shortcutDisplay: String? = nil
     public var presetsMinutes: [Int] = [15, 30, 60]
+    public var presetRules: [ReminderPreset]? = nil
     public var lastDigestDay: String = ""
     public init() {}
 }

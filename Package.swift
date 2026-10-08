@@ -14,5 +14,8 @@ let package = Package(
         .executableTarget(name: "SecretaryMac", dependencies: ["SecretaryCore"], resources: [.process("Resources")]),
         .executableTarget(name: "SecretaryCoreChecks", dependencies: ["SecretaryCore", "CSQLite3"], path: "Tests/SecretaryCoreChecks"),
         .executableTarget(name: "SecretaryAISmoke", dependencies: ["SecretaryCore"], path: "Tests/SecretaryAISmoke"),
+        .executableTarget(name: "SecretaryPresetChecks", dependencies: ["SecretaryCore"], path: "Tests/SecretaryPresetChecks"),
+        .executableTarget(name: "SecretaryCommandChecks", dependencies: ["SecretaryCore"], path: "Tests/SecretaryCommandChecks"),
+        .executableTarget(name: "SecretaryCommandSmoke", dependencies: ["SecretaryCore"], path: "Tests/SecretaryCommandSmoke"),
     ]
 )
