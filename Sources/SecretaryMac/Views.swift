@@ -363,6 +363,7 @@ final class ManagementWebHost: NSObject, WKScriptMessageHandler, WKNavigationDel
         if action == "close" { close(); return }
         if action == "add" { capture(); return }
         if action == "all" { model.focusedNotificationIDs = nil; resetRoute(); return }
+        if action == "clearNotificationContext" { model.focusedNotificationIDs = nil; return }
         if action == "permission" { SecretaryModel.openSystemNotificationSettings(); return }
         if action == "clearHistory" {
             let alert = NSAlert()

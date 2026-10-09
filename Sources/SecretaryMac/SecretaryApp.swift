@@ -934,29 +934,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
                 guard model.update(entry) else { throw RecognitionError.invalid("无法保存合并测试事项") }
                 return entry
             }
+            var unrelated = ReminderItem(text: "无关事项原话", now: now.addingTimeInterval(-3600))
+            try unrelated.apply(.init(title: "无关事项", reminder: now.addingTimeInterval(-5),
+                                      deadline: nil, suggestedCompletion: nil), now: now.addingTimeInterval(-3600))
+            guard model.update(unrelated) else { exit(126) }
+            var future = ReminderItem(text: "稍后通知目标", now: now)
+            try future.apply(.init(title: "稍后通知目标", reminder: now.addingTimeInterval(3600),
+                                   deadline: nil, suggestedCompletion: nil), now: now)
+            var futureOther = ReminderItem(text: "其他稍后事项", now: now)
+            try futureOther.apply(.init(title: "其他稍后事项", reminder: now.addingTimeInterval(7200),
+                                        deadline: nil, suggestedCompletion: nil), now: now)
+            guard model.update(future), model.update(futureOther) else { exit(126) }
             let payload: [String: Any] = ["itemIDs": entries.map { $0.id.uuidString }]
             openNotificationPayload(payload)
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
                 guard let self, let web = self.managementWeb?.webView else { exit(126) }
                 let script = """
-                (()=>{const rows=[...document.querySelectorAll('#c-rows .c-line')];return JSON.stringify({count:rows.length,focus:document.querySelector('#c-notices')?.innerText,titles:rows.map(row=>row.innerText.slice(0,10))})})()
+                (()=>{const rows=[...document.querySelectorAll('#c-rows .c-line')],selected=document.querySelector('.c-line.selected')?.dataset.item,linked=[\(entries.map { "'\($0.id.uuidString)'" }.joined(separator: ","))];return JSON.stringify({count:rows.length,notified:document.querySelectorAll('.c-notification-marker').length,context:document.querySelector('#c-notices')?.innerText,selectedLinked:linked.includes(selected),unrelated:rows.some(x=>x.innerText.includes('无关事项')),showAll:!!document.querySelector('#show-all')})})()
                 """
                 web.evaluateJavaScript(script) { value, error in
-                    guard error == nil, let text = value as? String, text.contains("\"count\":6"),
-                          text.contains("仅显示这次提醒"), (1...6).allSatisfy({ text.contains("标题\($0)") }) else {
-                        fputs("通知关联页面失败：\(String(describing: value)) \(String(describing: error))\n", stderr)
+                    guard error == nil, let text = value as? String,
+                          text.contains("\"count\":7"), text.contains("\"notified\":6"),
+                          text.contains("\"selectedLinked\":true"), text.contains("\"unrelated\":true"),
+                          text.contains("\"showAll\":false"), text.contains("本次提醒 6 件") else {
+                        fputs("合并通知定位失败：\(String(describing: value)) \(String(describing: error))\n", stderr)
                         exit(127)
                     }
-                    web.evaluateJavaScript("document.querySelector('#show-all').click()") { _, _ in
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                            web.evaluateJavaScript("!document.querySelector('#show-all')") { restored, error in
-                                try? FileManager.default.removeItem(at: directory)
-                                guard error == nil, (restored as? NSNumber)?.boolValue == true else {
-                                    fputs("通知恢复全部失败：\(String(describing: restored)) \(String(describing: error))\n", stderr)
-                                    exit(128)
+                    web.evaluateJavaScript("document.querySelector('[data-item=\"\(unrelated.id.uuidString)\"]').click();JSON.stringify({count:document.querySelectorAll('.c-notification-marker').length,context:!!document.querySelector('.c-notification-context')})") { clicked, clickError in
+                        guard clickError == nil, let clicked = clicked as? String,
+                              clicked.contains("\"count\":6"), clicked.contains("\"context\":true") else { exit(138) }
+                        web.evaluateJavaScript("document.querySelector('[data-filter=\"later\"]').click();document.querySelector('[data-filter=\"current\"]').click();document.querySelectorAll('.c-notification-marker').length") { kept, tabError in
+                            guard tabError == nil, (kept as? NSNumber)?.intValue == 6 else { exit(139) }
+                            self.openNotificationPayload(["itemIDs": [future.id.uuidString]])
+                        }
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                        let single = """
+                        (()=>JSON.stringify({count:document.querySelectorAll('#c-rows .c-line').length,selected:document.querySelector('.c-line.selected')?.dataset.item,tab:document.querySelector('[data-filter="later"]')?.classList.contains('chosen'),other:document.querySelector('#c-rows')?.innerText.includes('其他稍后事项'),context:!!document.querySelector('.c-notification-context')}))()
+                        """
+                        web.evaluateJavaScript(single) { result, error in
+                            try? FileManager.default.removeItem(at: directory)
+                            guard error == nil, let result = result as? String,
+                                  result.contains("\"count\":2"), result.contains(future.id.uuidString),
+                                  result.contains("\"tab\":true"), result.contains("\"other\":true"),
+                                  result.contains("\"context\":false") else {
+                                fputs("单条通知定位失败：\(String(describing: result)) \(String(describing: error))\n", stderr)
+                                exit(128)
+                            }
+                            guard let window = self.management else { exit(140) }
+                            window.performClose(nil)
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                                guard self.model.focusedNotificationIDs == nil else { exit(141) }
+                                self.showManagement()
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                                    web.evaluateJavaScript("!document.querySelector('.c-notification-context') && document.querySelectorAll('.c-notification-marker').length===0") { closed, error in
+                                        guard error == nil, (closed as? NSNumber)?.boolValue == true else { exit(142) }
+                                        print("点击行和切换 Tab 保留本次提醒标记；关闭管理窗口自动清除并恢复普通列表：通过")
+                                        NSApp.terminate(nil)
+                                    }
                                 }
-                                print("合并通知关联六项、路由完整集合并可切回全部：通过")
-                                NSApp.terminate(nil)
                             }
                         }
                     }
@@ -1753,7 +1789,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
     }
 
     @objc func showManagement() {
-        model.focusedNotificationIDs = nil
         presentManagement()
     }
 
@@ -1763,6 +1798,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
                                   styleMask: [.titled, .closable, .resizable],
                                   backing: .buffered, defer: false)
             management?.isReleasedWhenClosed = false
+            management?.delegate = self
             management?.title = "My Secretary · 事项"
             management?.backgroundColor = NSColor(calibratedRed: 0.973, green: 0.980, blue: 0.984, alpha: 1)
             management?.center()
@@ -1774,7 +1810,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
             management?.contentView = host.webView
         }
         // Preserve the web view across routes; reset only its transient navigation.
-        managementWeb?.resetRoute()
+        if management?.isVisible != true { managementWeb?.resetRoute() }
         NSApp.activate(ignoringOtherApps: true)
         management?.makeKeyAndOrderFront(nil)
     }
@@ -1802,7 +1838,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
     }
 
     func windowWillClose(_ notification: Notification) {
-        if let closing = notification.object as? NSWindow, closing === settingsWindow { restoreShortcut() }
+        guard let closing = notification.object as? NSWindow else { return }
+        if closing === settingsWindow { restoreShortcut() }
+        if closing === management { model.focusedNotificationIDs = nil }
     }
 
     private func installHotKeyHandler() {
