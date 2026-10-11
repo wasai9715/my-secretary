@@ -4,7 +4,7 @@
 
 ## 下载安装
 
-在 [GitHub Releases](https://github.com/wasai9715/my-secretary/releases) 下载最新预览版 DMG：Apple Silicon 选 `arm64`，Intel Mac 选 `x86_64`。要求 macOS 14 或更新版本。打开 DMG 后将 `MySecretary.app` 拖入「应用程序」文件夹，再从「应用程序」启动；它是菜单栏应用，不会出现常驻 Dock 图标。首次启动需要在设置中提供**你自己的 DeepSeek API Token**、测试连接，并在 macOS「系统设置 → 通知」允许提醒；调用模型可能产生费用。请只下载经过 Developer ID 签名和 Apple 公证的正式 Release 文件；如发布页尚无 DMG，请按下文从源码构建。
+⚠️ [GitHub Releases](https://github.com/wasai9715/my-secretary/releases) 提供的是 **未经 Apple Developer ID 签名、未经 Apple 公证的实验性预览版 DMG**。只在信任此仓库并理解风险时安装；请勿将其当作已获 Apple 验证的软件，亦勿依赖其承担重要提醒。Apple Silicon 选 `arm64`，Intel Mac 选 `x86_64`，要求 macOS 14 或更新版本。可用同名 `.sha256` 文件核对下载完整性（它不能证明发布者身份）。打开 DMG 并阅读其中的 `READ-ME-FIRST.txt`，将 `MySecretary.app` 拖入「应用程序」。如果首次启动被 macOS 拦截，**仅在确认来源可信后**尝试启动一次，再到「系统设置 → 隐私与安全性」为 MySecretary 选择「仍要打开」；不要全局关闭 Gatekeeper，也不要执行网上提供的批量移除隔离属性命令。它是菜单栏应用，不会出现常驻 Dock 图标。首次启动需要在设置中提供**你自己的 DeepSeek API Token**、测试连接，并在「系统设置 → 通知」允许提醒；调用模型可能产生费用。
 
 应用将事项与配置保存于本机 `~/Library/Application Support/MySecretary/`，模型请求会将输入发送至你在设置中配置的 HTTPS 模型服务。Token 目前保存在本地 `model.json`（仅当前用户权限），**尚未使用钥匙串**；不提供同步、云端备份或自动更新。更新时退出菜单栏应用，下载新版本并覆盖旧 `.app`，数据目录不会因覆盖应用而删除。卸载时退出应用，删除 `.app`；如需彻底清除本地数据，再手动删除上述目录。不要将其中的文件上传到 Issue。
 
@@ -43,7 +43,7 @@ scripts/build-app.sh
 open dist/MySecretary.app
 ```
 
-首次运行从菜单栏打开「设置」，填入 DeepSeek Token 并测试连接，**同时在 macOS 系统设置中允许 MySecretary 发送通知**；然后再使用菜单栏「记下一件事」或默认 `⌃⇧9`。设置页可点击「录制快捷键」并直接按自定义组合，注册成功才会保存；若冲突则保留旧快捷键。若通知被拒绝，连接模型成功也无法弹出到期提醒；新版菜单栏会持续标记通知不可用。配置和事项存于 `~/Library/Application Support/MySecretary/`；Token 存本地配置文件（仅当前用户权限），请自行妥善保管。生成的 `dist/` 不纳入版本控制。`scripts/build-app.sh` 产生的是**仅供本机开发的临时签名应用**，不能作为已签名公证的发行版。
+首次运行从菜单栏打开「设置」，填入 DeepSeek Token 并测试连接，**同时在 macOS 系统设置中允许 MySecretary 发送通知**；然后再使用菜单栏「记下一件事」或默认 `⌃⇧9`。设置页可点击「录制快捷键」并直接按自定义组合，注册成功才会保存；若冲突则保留旧快捷键。若通知被拒绝，连接模型成功也无法弹出到期提醒；新版菜单栏会持续标记通知不可用。配置和事项存于 `~/Library/Application Support/MySecretary/`；Token 存本地配置文件（仅当前用户权限），请自行妥善保管。生成的 `dist/` 不纳入版本控制。`scripts/build-app.sh` 产生的是 **ad-hoc 临时签名应用**，`scripts/package-preview.sh` 仅将它打包为明确标注 UNNOTARIZED 的预览版；两者都不是已获 Apple 公证的发行版。
 
 **已实现的基础链路：** Swift 原生菜单栏/录入浮层、SQLite 事项存储、模型测试、V11 逐行动理解后单项安排（多个独立行动提示分次录入）、有限结构/时序校验纠错、通知调度的初版、基础管理列表及本地检查。历史事项不自动重识别。**未实现或未验收：** 通知权限关闭/恢复与通知点击、合并通知截断的完整真机验收；登录启动及睡眠/勿扰的实际桌面验收；两周试用。识别失败人工重试、日期预设、自然语言多动作与列表分组已提供，但仍须经过实际使用验证。参见 [真机验收记录模板](docs/design/mac-v1-acceptance-checklist.md)。OpenSpec 任务未勾选表示尚未满足其完整验收条件。
 

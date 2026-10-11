@@ -17,7 +17,7 @@ identity="$(codesign -dv --verbose=4 "$app" 2>&1 | grep '^Authority=Developer ID
 [[ -n "$identity" ]] || { echo "App must have a Developer ID Application signature" >&2; exit 1; }
 arch="$(uname -m)"
 [[ "$arch" == arm64 || "$arch" == x86_64 ]] || { echo "Unsupported architecture: $arch" >&2; exit 1; }
-lipo -verify_arch "$arch" "$app/Contents/MacOS/MySecretary" || { echo "App architecture mismatch" >&2; exit 1; }
+lipo "$app/Contents/MacOS/MySecretary" -verify_arch "$arch" || { echo "App architecture mismatch" >&2; exit 1; }
 
 notarize() {
   xcrun notarytool submit "$1" --key "$NOTARY_KEY_FILE" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" --wait

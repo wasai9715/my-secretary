@@ -1,4 +1,4 @@
-name: Signed prerelease
+name: Unnotarized preview DMG
 on:
   push:
     tags: ['v*.*.*']
@@ -6,16 +6,14 @@ permissions:
   contents: read
 jobs:
   package:
-    name: Package ${{ matrix.runner }}
-    # Configure the "release" environment with required reviewers before adding secrets.
-    environment: release
+    name: Package ${{ matrix.arch }} (UNNOTARIZED)
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-15
+          - runner: macos-15-intel
             arch: x86_64
-          - runner: macos-15-xlarge
+          - runner: macos-15
             arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
@@ -23,47 +21,18 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Validate version, runner and secrets
+      - name: Validate release ref and architecture
         shell: bash
-        env:
-          CERTIFICATE_P12_BASE64: ${{ secrets.CERTIFICATE_P12_BASE64 }}
-          CERTIFICATE_PASSWORD: ${{ secrets.CERTIFICATE_PASSWORD }}
-          NOTARY_KEY_P8_BASE64: ${{ secrets.NOTARY_KEY_P8_BASE64 }}
-          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
-          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
         run: |
           set -euo pipefail
           [[ "$GITHUB_REF_NAME" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]] || exit 1
           [[ "$(uname -m)" == '${{ matrix.arch }}' ]] || { echo 'Runner architecture mismatch'; exit 1; }
           git merge-base --is-ancestor HEAD origin/main || { echo 'Release tag is not on main'; exit 1; }
-          for key in CERTIFICATE_P12_BASE64 CERTIFICATE_PASSWORD NOTARY_KEY_P8_BASE64 NOTARY_KEY_ID NOTARY_ISSUER_ID; do
-            [[ -n "${!key}" ]] || { echo "Missing release secret: $key"; exit 1; }
-          done
-      - name: Install signing identity and notarization key
+      - name: Build and package unnotarized preview
         shell: bash
         env:
-          CERTIFICATE_P12_BASE64: ${{ secrets.CERTIFICATE_P12_BASE64 }}
-          CERTIFICATE_PASSWORD: ${{ secrets.CERTIFICATE_PASSWORD }}
-          NOTARY_KEY_P8_BASE64: ${{ secrets.NOTARY_KEY_P8_BASE64 }}
-        run: |
-          set -euo pipefail
-          echo "$CERTIFICATE_P12_BASE64" | base64 -D > "$RUNNER_TEMP/certificate.p12"
-          echo "$NOTARY_KEY_P8_BASE64" | base64 -D > "$RUNNER_TEMP/notary.p8"
-          chmod 600 "$RUNNER_TEMP/notary.p8"
-          keychain="$RUNNER_TEMP/release.keychain-db"
-          security create-keychain -p "$RUNNER_TEMP" "$keychain"
-          security set-keychain-settings -lut 21600 "$keychain"
-          security unlock-keychain -p "$RUNNER_TEMP" "$keychain"
-          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$RUNNER_TEMP" "$keychain"
-          security list-keychains -d user -s "$keychain"
-          rm "$RUNNER_TEMP/certificate.p12"
-          identity=$(security find-identity -v -p codesigning "$keychain" | grep -o 'Developer ID Application: [^"]*' | head -1 || true)
-          [[ -n "$identity" ]] || { echo 'Developer ID Application identity not found'; exit 1; }
-          echo "SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
-          echo "NOTARY_KEY_FILE=$RUNNER_TEMP/notary.p8" >> "$GITHUB_ENV"
-      - name: Build and check
-        shell: bash
+          APP_VERSION: ${{ github.ref_name }}
+          APP_BUILD_NUMBER: ${{ github.run_number }}
         run: |
           set -euo pipefail
           export APP_VERSION="${APP_VERSION#v}"
@@ -71,13 +40,8 @@ jobs:
           swift run SecretaryPresetChecks
           swift run SecretaryCommandChecks
           scripts/build-app.sh
-          # Desktop notification/window checks require a real logged-in macOS session.
-          scripts/package-release.sh
-        env:
-          APP_VERSION: ${{ github.ref_name }}
-          APP_BUILD_NUMBER: ${{ github.run_number }}
-          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
-          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+          # Window/notification checks require a real logged-in macOS session.
+          scripts/package-preview.sh
       - uses: actions/upload-artifact@v4
         with:
           name: dmg-${{ matrix.arch }}
@@ -85,16 +49,12 @@ jobs:
             dist/*.dmg
             dist/*.dmg.sha256
           if-no-files-found: error
-      - name: Remove temporary credentials
-        if: always()
-        run: |
-          security delete-keychain "$RUNNER_TEMP/release.keychain-db" 2>/dev/null || true
-          rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/certificate.p12"
   publish:
     needs: package
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # The repository owner must approve before any unnotarized binary is public.
     environment: release
     steps:
       - uses: actions/download-artifact@v4
@@ -102,15 +62,15 @@ jobs:
           pattern: dmg-*
           merge-multiple: true
           path: release
-      - name: Verify hashes and create prerelease
+      - name: Verify hashes and create unnotarized prerelease
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           cd release
           for hash in *.sha256; do sha256sum -c "$hash"; done
-          [[ $(find . -maxdepth 1 -name '*.dmg' | wc -l) -eq 2 ]]
+          [[ $(find . -maxdepth 1 -name '*-UNNOTARIZED.dmg' | wc -l) -eq 2 ]]
           gh release create "$GITHUB_REF_NAME" ./*.dmg ./*.sha256 \
             --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
-            --title "My Secretary $GITHUB_REF_NAME (预览版)" \
-            --notes '早期预览：尚未完成完整 V1 真机验收，请勿依赖其承担重要承诺提醒。需要 macOS 14+、自行提供 DeepSeek API Token，并在系统设置中允许通知。'
+            --title "My Secretary $GITHUB_REF_NAME (未公证预览版 / UNNOTARIZED)" \
+            --notes '⚠️ 未经过 Apple Developer ID 签名或 Apple 公证。macOS 可能阻止首次打开；请先确认下载来源可信，尝试启动后到「系统设置 → 隐私与安全性」选择「仍要打开」。早期预览：尚未完成完整 V1 真机验收，请勿依赖其承担重要承诺提醒。需要 macOS 14+、自行提供 DeepSeek API Token，并允许通知。'
