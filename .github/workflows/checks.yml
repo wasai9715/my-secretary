@@ -1,0 +1,20 @@
+name: Checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  swift:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run offline checks
+        run: |
+          swift build
+          swift run SecretaryCoreChecks
+          swift run SecretaryPresetChecks
+          swift run SecretaryCommandChecks
+          scripts/build-app.sh
+          codesign --verify --strict dist/MySecretary.app
