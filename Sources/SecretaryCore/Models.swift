@@ -217,6 +217,7 @@ public struct ReminderSettings: Codable, Sendable {
     public var shortcutDisplay: String? = nil
     public var presetsMinutes: [Int] = [15, 30, 60]
     public var presetRules: [ReminderPreset]? = nil
-    public var lastDigestDay: String = ""
+    public var lastDigestDay: String = "" // Kept for decoding existing settings files.
+    public var lastDigestSlot: String? = nil
     public init() {}
 }

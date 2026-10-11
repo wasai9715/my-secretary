@@ -334,8 +334,15 @@ final class SecretaryModel: ObservableObject {
     }
 
     func saveSettings() {
-        do { try files.saveSettings(settings) }
-        catch { message = "设置保存失败：\(error.localizedDescription)" }
+        do {
+            let stored = try files.loadSettings()
+            if stored.lastDigestSlot == nil &&
+                (stored.digestHour != settings.digestHour || stored.digestMinute != settings.digestMinute) {
+                // A legacy day-only marker must not block a newly chosen time.
+                settings.lastDigestDay = ""
+            }
+            try files.saveSettings(settings)
+        } catch { message = "设置保存失败：\(error.localizedDescription)" }
     }
 
     // Validate the whole form before a single persisted update. The original capture is
@@ -522,10 +529,11 @@ final class SecretaryModel: ObservableObject {
     func sendDigest(now: Date = .now) -> Bool {
         guard notificationGranted else { return false }
         if digestInFlight { return true }
+        guard ReminderSchedule.shouldSendDigest(at: now, settings: settings) else { return false }
         let pending = ReminderSchedule.digestPending(items, at: now)
-        let day = ReminderSchedule.digestDay(at: now)
+        let slot = ReminderSchedule.digestSlot(at: now, settings: settings)
         guard !pending.isEmpty else {
-            settings.lastDigestDay = day
+            settings.lastDigestSlot = slot
             saveSettings()
             return false
         }
@@ -537,8 +545,10 @@ final class SecretaryModel: ObservableObject {
             self.digestInFlight = false
             self.dispatchingIDs.subtract(due.map(\.id))
             guard success else { return }
-            self.settings.lastDigestDay = day
-            self.saveSettings()
+            if ReminderSchedule.digestSlot(at: now, settings: self.settings) == slot {
+                self.settings.lastDigestSlot = slot
+                self.saveSettings()
+            }
             for old in due {
                 guard let current = self.items.first(where: { $0.id == old.id }), current.status == .open,
                       current.nextReminder == old.nextReminder, current.notificationsSent == old.notificationsSent else { continue }
@@ -600,6 +610,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
             return
         }
         NSApp.setActivationPolicy(.accessory)
+        if let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+           let icon = NSImage(contentsOf: iconURL) {
+            NSApp.applicationIconImage = icon
+        }
         UNUserNotificationCenter.current().delegate = self
         model.refreshPermission(requestIfUndetermined: !isDiagnostic)
         createStatusMenu()
@@ -1554,7 +1568,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
         do {
             model = try SecretaryModel(files: LocalFiles(directory: directory))
             model.notificationGranted = true
-            let now = Date()
+            let now = Calendar.current.startOfDay(for: .now).addingTimeInterval(12 * 3600)
+            model.settings.digestHour = 11
+            model.settings.digestMinute = 0
+            model.settings.lastDigestDay = ReminderSchedule.digestDay(at: now)
+            model.saveSettings()
+            model.settings.digestHour = 12
+            model.saveSettings()
+            guard model.settings.lastDigestDay.isEmpty,
+                  ReminderSchedule.shouldSendDigest(at: now, settings: model.settings) else { exit(88) }
             var expired = ReminderItem(text: "汇总过期事项", now: now.addingTimeInterval(-3600))
             try expired.apply(.init(title: "过期", reminder: now.addingTimeInterval(-120), deadline: nil,
                                     suggestedCompletion: nil), now: now.addingTimeInterval(-3600))
@@ -1571,16 +1593,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
                 guard Set(ids) == Set([expired.id, pending.id]) else { exit(84) }
                 completion(succeeds)
             }
-            guard model.sendDigest(now: now), sent == 1, model.settings.lastDigestDay.isEmpty,
+            guard model.sendDigest(now: now), sent == 1, model.settings.lastDigestSlot == nil,
                   model.items.first(where: { $0.id == expired.id })?.notificationsSent == 0 else { exit(85) }
             succeeds = true
             guard model.sendDigest(now: now), sent == 2,
-                  model.settings.lastDigestDay == ReminderSchedule.digestDay(at: now),
+                  model.settings.lastDigestSlot == ReminderSchedule.digestSlot(at: now, settings: model.settings),
                   model.items.first(where: { $0.id == expired.id })?.notificationsSent == 1,
                   model.items.first(where: { $0.id == pending.id })?.notificationsSent == 1,
                   model.items.first(where: { $0.id == snoozed.id })?.notificationsSent == 0,
                   !ReminderSchedule.shouldSendDigest(at: now, settings: model.settings) else { exit(86) }
-            print("汇总失败可重试；成功记录当天并推进同轮到期事项，排除未来推迟：通过")
+            guard !model.sendDigest(now: now), sent == 2 else { exit(86) }
+            model.settings.digestMinute = 1
+            guard model.sendDigest(now: now.addingTimeInterval(60)), sent == 3,
+                  !model.sendDigest(now: now.addingTimeInterval(75)) else { exit(86) }
+            let reopened = try SecretaryModel(files: LocalFiles(directory: directory))
+            guard !ReminderSchedule.shouldSendDigest(at: now.addingTimeInterval(90), settings: reopened.settings) else { exit(86) }
+            print("失败可重试；同一时间及重启后不重复；当天改时间可再次汇总：通过")
             NSApp.terminate(nil)
         } catch { fputs("每日汇总检查失败：\(error)\n", stderr); exit(87) }
     }
@@ -1590,7 +1618,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
         do {
             model = try SecretaryModel(files: LocalFiles(directory: directory))
             model.notificationGranted = true
-            model.settings.lastDigestDay = ReminderSchedule.digestDay(at: .now)
+            model.settings.lastDigestSlot = ReminderSchedule.digestSlot(at: .now, settings: model.settings)
             let now = Date()
             var item = ReminderItem(text: "系统时钟变化测试", now: now.addingTimeInterval(-3600))
             try item.apply(.init(title: "时钟测试", reminder: now.addingTimeInterval(-60),

@@ -26,9 +26,21 @@ public enum ReminderSchedule {
         calendar.startOfDay(for: now).formatted(.iso8601)
     }
 
+    /// An occurrence is keyed by both local day and configured time. Editing
+    /// today's time creates a new occurrence; repeated timer ticks do not.
+    public static func digestSlot(at now: Date, settings: ReminderSettings, calendar: Calendar = .current) -> String {
+        "\(digestDay(at: now, calendar: calendar))|\(settings.digestHour):\(settings.digestMinute)"
+    }
+
     public static func shouldSendDigest(at now: Date, settings: ReminderSettings, calendar: Calendar = .current) -> Bool {
         let time = (calendar.component(.hour, from: now), calendar.component(.minute, from: now))
-        return time >= (settings.digestHour, settings.digestMinute) && digestDay(at: now, calendar: calendar) != settings.lastDigestDay
+        guard time >= (settings.digestHour, settings.digestMinute) else { return false }
+        if let lastSlot = settings.lastDigestSlot {
+            return digestSlot(at: now, settings: settings, calendar: calendar) != lastSlot
+        }
+        // Older settings only recorded the day. Do not resend on upgrade unless
+        // the user explicitly saves a different scheduled time.
+        return digestDay(at: now, calendar: calendar) != settings.lastDigestDay
     }
 
     public static func summary(_ items: [ReminderItem], maxTitles: Int = 3) -> String {

@@ -371,10 +371,27 @@ func run() async throws {
     try check(!ReminderSchedule.shouldSendDigest(at: firstDigest.addingTimeInterval(-60), settings: digestSettings, calendar: digestCalendar) &&
               ReminderSchedule.shouldSendDigest(at: firstDigest, settings: digestSettings, calendar: digestCalendar),
               "每日默认17:00到点才汇总")
+    var legacySettingsJSON = try JSONSerialization.jsonObject(with: JSONEncoder().encode(digestSettings)) as! [String: Any]
+    legacySettingsJSON.removeValue(forKey: "lastDigestSlot")
+    let decodedLegacy = try JSONDecoder().decode(ReminderSettings.self, from: JSONSerialization.data(withJSONObject: legacySettingsJSON))
+    try check(decodedLegacy.lastDigestSlot == nil, "旧设置文件可读取")
     digestSettings.lastDigestDay = ReminderSchedule.digestDay(at: firstDigest, calendar: digestCalendar)
+    try check(!ReminderSchedule.shouldSendDigest(at: firstDigest.addingTimeInterval(60), settings: digestSettings, calendar: digestCalendar),
+              "旧设置当天已汇总时升级不补发")
+    digestSettings.lastDigestSlot = ReminderSchedule.digestSlot(at: firstDigest, settings: digestSettings, calendar: digestCalendar)
     try check(!ReminderSchedule.shouldSendDigest(at: firstDigest.addingTimeInterval(3600), settings: digestSettings, calendar: digestCalendar) &&
               ReminderSchedule.shouldSendDigest(at: firstDigest.addingTimeInterval(24 * 3600), settings: digestSettings, calendar: digestCalendar),
-              "同日只汇总一次，隔日继续")
+              "同一设定时间只汇总一次，隔日继续")
+    // Changing today's configured time creates a new occurrence, not a second
+    // send of the same occurrence. A legacy day marker must not suppress it.
+    digestSettings.digestHour = 18
+    digestSettings.digestMinute = 34
+    try check(!ReminderSchedule.shouldSendDigest(at: firstDigest.addingTimeInterval(93 * 60), settings: digestSettings, calendar: digestCalendar) &&
+              ReminderSchedule.shouldSendDigest(at: firstDigest.addingTimeInterval(94 * 60), settings: digestSettings, calendar: digestCalendar),
+              "当天改汇总时间后新时间到点可汇总")
+    digestSettings.lastDigestSlot = ReminderSchedule.digestSlot(at: firstDigest.addingTimeInterval(94 * 60), settings: digestSettings, calendar: digestCalendar)
+    try check(!ReminderSchedule.shouldSendDigest(at: firstDigest.addingTimeInterval(95 * 60), settings: digestSettings, calendar: digestCalendar),
+              "同一时间只汇总一次")
     digestSettings.digestHour = 9
     digestSettings.digestMinute = 35
     try check(ReminderSchedule.shouldSendDigest(at: firstDigest.addingTimeInterval(24 * 3600 - 7 * 3600 - 25 * 60), settings: digestSettings, calendar: digestCalendar),
