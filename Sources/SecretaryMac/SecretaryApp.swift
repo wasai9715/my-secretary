@@ -130,7 +130,7 @@ final class SecretaryModel: ObservableObject {
                       recognitionAttempts[item.id] == attempt else { return }
                 current.fail(error.localizedDescription)
                 guard update(current) else { return }
-                message = "识别失败：\(current.title)"
+                message = "安排失败：\(current.title)"
                 sendNotification(title: "提醒尚未安排", body: "\(current.title) — 点击设置时间或重试", ids: [current.id])
             }
         }
@@ -141,19 +141,19 @@ final class SecretaryModel: ObservableObject {
         guard configuration.verified else { message = "请先测试 DeepSeek 连接"; return false }
         guard var item = items.first(where: { $0.id == id }), item.status == .open,
               item.recognition == .needsAttention, item.needsSeparateEntries != true else {
-            message = "只有识别失败的待处理事项可以重试；多行动请分别录入"
+            message = "无法重试，请手动设置或分开记录"
             return false
         }
         // A manual edit, including one without a reminder, must never be undone by AI.
         guard item.manualVersion == 0, item.text == item.originalText else {
-            message = "事项已手动修改，请手动设置提醒时间"
+            message = "内容已修改，请手动设置时间"
             return false
         }
         item.recognition = .interpreting
         item.failure = nil
         item.nextReminder = nil
         guard update(item) else { return false }
-        message = "正在重新识别"
+        message = "正在重新安排"
         startRecognition(for: item)
         return true
     }
@@ -176,13 +176,31 @@ final class SecretaryModel: ObservableObject {
     }
 
     @discardableResult
+    func deleteHistoryItem(_ id: UUID) -> Bool {
+        guard let item = items.first(where: { $0.id == id }), item.status != .open else {
+            message = "只能删除已结束的事项"
+            return false
+        }
+        do {
+            try store.delete(id)
+            items.removeAll { $0.id == id }
+            focusedNotificationIDs?.remove(id)
+            onItemsChanged?()
+            message = "已删除"
+            return true
+        } catch {
+            message = "删除历史事项失败：\(error.localizedDescription)"
+            return false
+        }
+    }
+
     func clearHistory() -> Bool {
         let history = items.filter { $0.status != .open }
         do {
             for entry in history { try store.delete(entry.id) }
             items.removeAll { $0.status != .open }
             onItemsChanged?()
-            message = "已清空历史事项"
+            message = "已清空历史"
             return true
         } catch {
             items = (try? store.all()) ?? items
@@ -1100,7 +1118,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
         """) as? String
         guard submitted == "submitted" else { throw RecognitionError.invalid(submitted ?? "指令输入未提交") }
         try await Task.sleep(for: .milliseconds(300))
-        let shown = try await web.evaluateJavaScript("document.querySelector('#c-reminder-preview')?.innerText.includes('选择上面的预设')") as? Bool
+        let shown = try await web.evaluateJavaScript("document.querySelector('#c-reminder-preview')?.innerText.includes('时间不明确')") as? Bool
         guard shown == true else { throw RecognitionError.invalid("晚点没有提示选择预设") }
         let previewDate = initial.addingTimeInterval(9300)
         model.timeEditOverride = { _, _ in .update(TimeEdit(reminder: previewDate)) }
@@ -1109,15 +1127,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
         """) as? Bool
         guard submittedPreview == true else { throw RecognitionError.invalid("未提交自然语言时间") }
         try await Task.sleep(for: .milliseconds(300))
-        let hasPreview = try await web.evaluateJavaScript("document.querySelector('#c-reminder-preview')?.innerText.includes('将改为')") as? Bool
-        guard hasPreview == true, model.items.first?.nextReminder == safePreviewDate else {
-            throw RecognitionError.invalid("解析时间时提前修改了提醒")
+        guard model.items.first?.nextReminder == safePreviewDate else {
+            throw RecognitionError.invalid("越过截止前不应调整提醒")
+        }
+        let warning = try await web.evaluateJavaScript("document.querySelector('#c-reminder-preview')?.innerText.includes('晚于截止')") as? Bool
+        guard warning == true, model.items.first?.nextReminder == safePreviewDate else {
+            throw RecognitionError.invalid("超过截止未要求再次确认")
         }
         _ = try await web.evaluateJavaScript("document.querySelector('#c-reminder-preview button')?.click()")
         try await Task.sleep(for: .milliseconds(200))
-        let warning = try await web.evaluateJavaScript("document.querySelector('#c-reminder-preview')?.innerText.includes('晚于明确截止')") as? Bool
-        guard warning == true, model.items.first?.nextReminder == safePreviewDate else {
-            throw RecognitionError.invalid("超过截止未要求再次确认")
+        guard model.items.first?.nextReminder == previewDate else {
+            throw RecognitionError.invalid("确认越过截止后未保存提醒")
         }
         let revisedDeadline = initial.addingTimeInterval(10_800)
         model.timeEditOverride = { _, _ in .update(TimeEdit(reminder: initial.addingTimeInterval(9600),
@@ -1127,18 +1147,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
         """) as? String
         guard edited == "submitted" else { throw RecognitionError.invalid(edited ?? "编辑指令不可用") }
         try await Task.sleep(for: .milliseconds(300))
-        let editPreview = try await web.evaluateJavaScript("document.querySelector('#c-edit-preview')?.innerText.includes('提醒改为') && document.querySelector('#c-edit-preview')?.innerText.includes('明确截止改为') && !document.querySelector('#c-edit-preview')?.innerText.includes('内容改为')") as? Bool
-        guard editPreview == true, model.items.first?.text == "查订单",
-              model.items.first?.deadline == item.deadline else {
-            throw RecognitionError.invalid("编辑时间预览提前提交或修改了内容")
-        }
-        _ = try await web.evaluateJavaScript("document.querySelector('#c-edit-preview button')?.click()")
-        try await Task.sleep(for: .milliseconds(200))
+        let hasParseButtons = try await web.evaluateJavaScript("document.body.innerText.includes('解析时间')") as? Bool
+        guard hasParseButtons == false else { throw RecognitionError.invalid("仍显示解析时间按钮") }
         guard model.items.first?.nextReminder == initial.addingTimeInterval(9600),
               model.items.first?.deadline == revisedDeadline, model.items.first?.text == "查订单" else {
             throw RecognitionError.invalid("提醒与截止未一起提交或误修改内容")
         }
-        print("提醒与截止分别预览后原子提交，内容不受模型修改；含糊提醒不猜时间：通过")
+        print("回车直接提交提醒与截止，越过截止仍需确认；内容不受模型修改；含糊提醒不猜时间：通过")
     }
 
     private func checkSuccessBanner() async throws {
@@ -1232,7 +1247,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
                 guard let self, let web = self.managementWeb?.webView else { exit(111) }
                 let script = """
-                (()=>{if(!document.querySelector('[data-filter="current"]'))return '页面未加载:'+document.URL+':'+document.body?.innerText.slice(0,80);const result=[];for(const [tab,expected] of [['current','当前项'],['later','稍后项'],['attention','待识别原话'],['history','历史项']]){document.querySelector('[data-filter="'+tab+'"]').click();const row=document.querySelector('#c-rows')?.innerText||'';if(!row.includes(expected))return '缺少'+tab+':'+row;result.push(tab)}document.querySelector('[data-filter="current"]').click();const detail=document.querySelector('#c-detail');if(!detail?.innerText.includes('提醒时间来源')||!detail?.innerText.includes('当前原话'))return '来源或原话不可见';detail.querySelector('[data-action="snooze"]').click();const buttons=[...document.querySelectorAll('.c-snooze-popover .quick button')];if(buttons.length!==2||!buttons[1].innerText.includes('明天 09:00'))return '日期预设未显示';buttons[0].click();return document.querySelector('.c-snooze-feedback button')?.innerText.includes('确认越过截止')?'ok':'未提供截止确认'})()
+                (()=>{if(!document.querySelector('[data-filter="current"]'))return '页面未加载:'+document.URL+':'+document.body?.innerText.slice(0,80);const result=[];for(const [tab,expected] of [['current','当前项'],['later','稍后项'],['attention','待识别原话'],['history','历史项']]){document.querySelector('[data-filter="'+tab+'"]').click();const row=document.querySelector('#c-rows')?.innerText||'';if(!row.includes(expected))return '缺少'+tab+':'+row;const deleteButton=document.querySelector('#c-detail [data-action="deleteHistoryItem"]');if((tab==='history')!==!!deleteButton)return '历史删除入口显示错误:'+tab;if(tab==='history'){document.querySelector('[data-action="restore"]').click();const dialog=document.querySelector('#c-modal-layer [role="dialog"]');const input=dialog?.querySelector('[name="reminder"]');if(!dialog||!input||document.activeElement!==input||!input.getBoundingClientRect().height)return '恢复表单未显眼展示或未聚焦';dialog.querySelector('[data-close]').click();if(document.querySelector('#c-modal-layer [role="dialog"]'))return '恢复窗口未关闭'}result.push(tab)}document.querySelector('[data-filter="current"]').click();const detail=document.querySelector('#c-detail');if(!detail?.innerText.includes('时间依据')||!detail?.innerText.includes('当前原话'))return '来源或原话不可见';detail.querySelector('[data-action="snooze"]').click();const buttons=[...document.querySelectorAll('.c-snooze-popover .quick button')];if(buttons.length!==2||!buttons[1].innerText.includes('明天 09:00'))return '日期预设未显示';buttons[0].click();return document.querySelector('.c-snooze-feedback button')?.innerText.includes('仍要设置')?'ok':'未提供截止确认'})()
                 """
                 web.evaluateJavaScript(script) { value, error in
                     try? FileManager.default.removeItem(at: directory)
@@ -1240,7 +1255,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
                         fputs("管理列表检查失败：\(String(describing: value)) \(String(describing: error))\n", stderr)
                         exit(112)
                     }
-                    print("当前、稍后、待识别、历史与原话/时间来源显示：通过")
+                    print("当前、稍后、待定、已结束与原话/时间依据显示；恢复表单弹窗可见：通过")
                     NSApp.terminate(nil)
                 }
             }
@@ -1619,11 +1634,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
                   model.restore(original, until: newTime, overrideDeadline: true), model.items.first?.status == .open,
                   model.items.first?.nextReminder == newTime,
                   model.items.first?.notificationsSent == 0 else { exit(96) }
+            var history = original
+            history.id = UUID()
+            history.status = .completed
+            guard model.update(history), !model.deleteHistoryItem(original.id),
+                  model.items.contains(where: { $0.id == original.id }),
+                  model.deleteHistoryItem(history.id),
+                  !model.items.contains(where: { $0.id == history.id }) else { exit(99) }
             let reopened = try SecretaryModel(files: LocalFiles(directory: directory))
             guard reopened.items.first?.nextReminder == newTime,
                   reopened.items.first?.deadline == passedDeadline,
-                  reopened.items.first?.status == .open else { exit(97) }
-            print("过期仍未完成；完成/取消、立即撤销与历史选新时间恢复持久化：通过")
+                  reopened.items.first?.status == .open,
+                  !reopened.items.contains(where: { $0.id == history.id }) else { exit(97) }
+            print("过期仍未完成；完成/取消、立即撤销与历史选新时间恢复；历史单项删除且不误删待处理事项：通过")
             NSApp.terminate(nil)
         } catch { fputs("事项生命周期检查失败：\(error)\n", stderr); exit(98) }
     }
@@ -1646,12 +1669,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
         updateStatusMenu()
     }
 
+    private func noteMenuIcon() -> NSImage? {
+        guard let url = Bundle.module.url(forResource: "MenuIcon", withExtension: "png"),
+              let image = NSImage(contentsOf: url) else { return nil }
+        image.isTemplate = true
+        image.size = NSSize(width: 18, height: 18)
+        image.accessibilityDescription = "My Secretary"
+        return image
+    }
+
     private func updateStatusMenu() {
         guard statusItem != nil else { return }
         let unhealthy = !model.notificationGranted || model.items.contains { $0.recognition == .needsAttention && $0.status == .open }
         let processing = model.items.contains { $0.recognition == .interpreting && $0.status == .open }
-        statusItem.button?.image = NSImage(systemSymbolName: unhealthy ? "bell.slash.fill" : (processing ? "clock.arrow.circlepath" : "checklist"),
-                                          accessibilityDescription: unhealthy ? "My Secretary：提醒不可用或有待处理错误" : (processing ? "My Secretary：已记下，正在安排提醒" : "My Secretary"))
+        if unhealthy {
+            statusItem.button?.image = NSImage(systemSymbolName: "bell.slash.fill", accessibilityDescription: "My Secretary：提醒不可用或有待处理错误")
+        } else if processing {
+            statusItem.button?.image = NSImage(systemSymbolName: "clock.arrow.circlepath", accessibilityDescription: "My Secretary：已记下，正在安排提醒")
+        } else {
+            statusItem.button?.image = noteMenuIcon() ?? NSImage(systemSymbolName: "checklist", accessibilityDescription: "My Secretary")
+        }
         permissionItem?.isHidden = model.notificationGranted
         let pendingCount = model.items.filter { $0.status == .open }.count
         permissionItem?.title = "⚠️ 通知未开启 · \(pendingCount) 件待处理，打开系统设置"
@@ -1663,7 +1700,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
 
     private func createStatusMenu() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        statusItem.button?.image = NSImage(systemSymbolName: "checklist", accessibilityDescription: "My Secretary")
+        statusItem.button?.image = noteMenuIcon() ?? NSImage(systemSymbolName: "checklist", accessibilityDescription: "My Secretary")
         let menu = NSMenu()
         let capture = NSMenuItem(title: "记下一件事", action: #selector(showCapture), keyEquivalent: "")
         capture.target = self
@@ -1799,7 +1836,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
                                   backing: .buffered, defer: false)
             management?.isReleasedWhenClosed = false
             management?.delegate = self
-            management?.title = "My Secretary · 事项"
+            management?.title = "我的秘书 · 事项"
             management?.backgroundColor = NSColor(calibratedRed: 0.973, green: 0.980, blue: 0.984, alpha: 1)
             management?.center()
         }

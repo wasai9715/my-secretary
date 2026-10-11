@@ -13,9 +13,12 @@ cp .build/release/MySecretary_SecretaryCore.bundle/interpretation-prompt.txt "$a
 # SwiftPM's bare .bundle has no Info.plist and cannot be nested as signed code.
 rm -rf "$app/Contents/MacOS/MySecretary_SecretaryMac.bundle" "$app/MySecretary_SecretaryMac.bundle"
 cp .build/release/MySecretary_SecretaryMac.bundle/management.html "$app/Contents/Resources/management.html"
+cp Sources/SecretaryMac/Resources/AppIcon.icns "$app/Contents/Resources/AppIcon.icns"
+cp .build/release/MySecretary_SecretaryMac.bundle/MenuIcon.png "$app/Contents/Resources/MenuIcon.png"
 /usr/libexec/PlistBuddy -c 'Clear dict' "$app/Contents/Info.plist" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c 'Add :CFBundleIdentifier string com.mysecretary.mac' "$app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c 'Add :CFBundleName string MySecretary' "$app/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c 'Add :CFBundleIconFile string AppIcon' "$app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c 'Add :CFBundleExecutable string MySecretary' "$app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c 'Add :CFBundlePackageType string APPL' "$app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c 'Add :LSUIElement bool true' "$app/Contents/Info.plist"

@@ -105,64 +105,70 @@ struct CaptureFeedbackView: View {
         return date.formatted(.dateTime.month().day().hour().minute())
     }
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .top, spacing: 12) {
-                Image(systemName: "checkmark.circle.fill")
-                    .font(.system(size: 16, weight: .medium))
-                    .foregroundStyle(Color.accentColor)
-                    .frame(width: 22, height: 22)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("提醒已安排")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                    Text(feedback.title)
-                        .font(.system(size: 14, weight: .semibold))
-                        .lineLimit(2)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer(minLength: 0)
+    private var secondaryTime: String? {
+        if let day = feedback.deadlineDay {
+            let parts = day.split(separator: "-").compactMap { Int($0) }
+            if parts.count == 3 {
+                let year = parts[0] == Calendar.current.component(.year, from: Date()) ? "" : "\(parts[0]) 年 "
+                return "截止：\(year)\(parts[1]) 月 \(parts[2]) 日"
             }
-            HStack(spacing: 8) {
+            return "截止：\(day)"
+        }
+        if let deadline = feedback.deadline {
+            return "截止：\(deadline.formatted(.dateTime.month().day().hour().minute()))"
+        }
+        if let suggestion = feedback.suggestedCompletion {
+            return "建议完成：\(suggestion.formatted(.dateTime.month().day().hour().minute()))"
+        }
+        return nil
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 7) {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Color(red: 0.16, green: 0.48, blue: 0.84))
+                Text("提醒已安排")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
+            Text(feedback.title)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(.primary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: 5) {
                 Label(timeLabel, systemImage: "bell")
                     .foregroundStyle(.primary)
-                if let day = feedback.deadlineDay {
-                    Text("· 截止 \(day)").foregroundStyle(.secondary)
-                } else if let deadline = feedback.deadline {
-                    Text("· 截止 \(deadline.formatted(.dateTime.month().day().hour().minute()))")
+                if let secondaryTime {
+                    Text(secondaryTime)
                         .foregroundStyle(.secondary)
-                } else if let suggestion = feedback.suggestedCompletion {
-                    Text("· 建议完成 \(suggestion.formatted(.dateTime.month().day().hour().minute()))")
-                        .foregroundStyle(.secondary)
+                        .padding(.leading, 18)
                 }
-                Spacer(minLength: 0)
             }
-            .font(.system(size: 11))
+            .font(.system(size: 12))
             .lineLimit(1)
-            .help("点击查看或修改完整安排")
+            Divider()
             HStack {
                 Button("撤销录入", action: undo)
-                    .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button(action: openItem) {
-                    HStack(spacing: 3) {
-                        Text("查看或修改")
-                        Image(systemName: "arrow.up.right").font(.system(size: 9, weight: .medium))
-                    }
+                    Text("查看事项  →")
+                        .foregroundStyle(Color(red: 0.13, green: 0.41, blue: 0.72))
                 }
-                .buttonStyle(.plain)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(.secondary)
             }
+            .buttonStyle(.plain)
+            .font(.system(size: 11, weight: .medium))
         }
-        .padding(.horizontal, 17)
-        .padding(.vertical, 14)
-        .frame(width: 356, alignment: .leading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous)
+        .padding(16)
+        .frame(width: 336, alignment: .leading)
+        .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 13, style: .continuous)
             .strokeBorder(Color.primary.opacity(0.09), lineWidth: 1))
-        .padding(5)
+        .shadow(color: .black.opacity(0.12), radius: 12, y: 5)
+        .padding(12)
     }
 }
 
@@ -378,6 +384,19 @@ final class ManagementWebHost: NSObject, WKScriptMessageHandler, WKNavigationDel
         }
         guard let rawID = body["id"] as? String, let id = UUID(uuidString: rawID),
               let item = model.items.first(where: { $0.id == id }) else { return }
+        if action == "deleteHistoryItem" {
+            guard item.status != .open else { result(action, error: "只能删除历史事项"); return }
+            let alert = NSAlert()
+            alert.messageText = "永久删除这条历史事项？"
+            alert.informativeText = "「\(item.title)」将从本机永久删除，无法撤销。其他事项不会受影响。"
+            alert.addButton(withTitle: "删除")
+            alert.addButton(withTitle: "保留")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            let success = model.deleteHistoryItem(id)
+            if success && undoItem?.id == id { undoItem = nil; undoExpires = nil }
+            result(action, error: success ? nil : safeMessage(model.message))
+            return
+        }
         if action == "previewEditCommand" {
             guard let instruction = body["instruction"] as? String,
                   !instruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -385,7 +404,12 @@ final class ManagementWebHost: NSObject, WKScriptMessageHandler, WKNavigationDel
             }
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                self.commandResult(await self.model.previewEditCommand(id, instruction: instruction))
+                let outcome = await self.model.previewEditCommand(id, instruction: instruction)
+                if case .previewEdit = outcome {
+                    self.commandResult(self.model.confirmEditPreview(id))
+                } else {
+                    self.commandResult(outcome)
+                }
             }
             return
         }
@@ -400,7 +424,12 @@ final class ManagementWebHost: NSObject, WKScriptMessageHandler, WKNavigationDel
             }
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                self.commandResult(await self.model.previewReminderCommand(id, instruction: instruction))
+                let outcome = await self.model.previewReminderCommand(id, instruction: instruction)
+                if case .preview = outcome {
+                    self.commandResult(self.model.confirmReminderPreview(id))
+                } else {
+                    self.commandResult(outcome)
+                }
             }
             return
         }
